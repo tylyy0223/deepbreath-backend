@@ -1,0 +1,139 @@
+"""AI 对话服务 — 优化版：DB 操作后台化，优先流式响应"""
+import json
+import asyncio
+from datetime import datetime, timezone
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+
+from app.models.chat import ChatSession, ChatMessage
+from app.services.chatbot import chat_stream, chat_once
+from app.services.rag_search import search_wiki
+
+MODE_CONFIG = {
+    "science": {
+        "emoji": "\U0001f9e0", "label": "\U0001f9e0 心理科普",
+        "system_prompt": "你是一位专业的心理学知识科普助手。用通俗易懂的语言解释心理学概念、理论和实验。保持客观、科学、温暖的态度。回复使用中文。",
+    },
+    "counseling": {
+        "emoji": "\U0001f91d", "label": "\U0001f91d 心理倾听",
+        "system_prompt": "你是一位温暖、共情的心理倾听者。认真倾听，给予情感支持。绝不提供临床诊断。保持温暖、安全、非评判的态度。回复使用中文。",
+    },
+    "assessment": {
+        "emoji": "\U0001f4cb", "label": "\U0001f4cb 心理测评",
+        "system_prompt": "你是一位结构化心理评估引导者。通过系统性提问帮用户了解心理状态。保持专业、结构化、引导性的态度。回复使用中文。",
+    },
+    "reading": {
+        "emoji": "\U0001f4da", "label": "\U0001f4da 读书助手",
+        "system_prompt": "你是一位心理学读书导师。帮用户理解书中核心概念，联系实际生活。保持专业、有深度的态度。回复使用中文。",
+    },
+}
+
+
+async def send_message(
+    user_id: int,
+    session_id: int,
+    message: str,
+    mode: str = "science",
+    use_rag: bool = True,
+    db: AsyncSession | None = None,
+):
+    """发送消息并流式返回 AI 回复"""
+    if mode not in MODE_CONFIG:
+        mode = "science"
+    cfg = MODE_CONFIG[mode]
+
+    # RAG 检索后台启动（不依赖 DB session，与 DeepSeek API 调用并行）
+    async def do_rag():
+        if not use_rag: return ""
+        try:
+            results = await asyncio.to_thread(search_wiki, message, top_k=5 if mode != "reading" else 15)
+            if results:
+                parts = [f"【{r.get('title', '参考')}】\n{r.get('snippet', r.get('content', ''))[:400]}" for r in results[:5]]
+                return "\n\n".join(parts)
+        except Exception: pass
+        return ""
+
+    rag_task = asyncio.create_task(do_rag())
+
+    # DB 历史：快速加载最近消息
+    history_msgs = []
+    if db and session_id:
+        result = await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.desc()).limit(20)
+        )
+        history_msgs = list(reversed(result.scalars().all()))
+
+    rag_context = await rag_task
+
+    # 构建消息
+    api_messages = [{"role": "system", "content": cfg["system_prompt"]}]
+    if rag_context:
+        api_messages[0]["content"] += f"\n\n参考资料：\n{rag_context}"
+    for msg in history_msgs[-10:]:
+        api_messages.append({"role": msg.role, "content": msg.content})
+    api_messages.append({"role": "user", "content": message})
+
+    # 流式调用 AI
+    full_response = ""
+    total_tokens = 0
+    sources = []
+    try:
+        async for chunk in chat_stream(messages=api_messages, temperature=0.7 if mode != "reading" else 0.3):
+            typ = chunk.get("type", "")
+            if typ == "chunk":
+                full_response += chunk["content"]
+                yield {"chunk": chunk["content"]}
+            elif typ == "sources":
+                sources = chunk.get("sources", [])
+            elif typ == "usage":
+                total_tokens = chunk.get("total_tokens", 0)
+    except Exception:
+        try:
+            full_response = await chat_once(api_messages, temperature=0.7 if mode != "reading" else 0.3)
+            yield {"chunk": full_response}
+        except Exception:
+            yield {"chunk": "抱歉，AI 服务暂时不可用，请稍后重试。"}
+
+    # 后台保存（不阻塞响应）
+    if db and session_id:
+        try:
+            db.add(ChatMessage(session_id=session_id, role="user", content=message))
+            if full_response:
+                db.add(ChatMessage(session_id=session_id, role="assistant", content=full_response,
+                       token_count=total_tokens or len(full_response)))  # 真实 token 计数，降级为字符数
+            await db.execute(
+                update(ChatSession)
+                .where(ChatSession.id == session_id)
+                .values(message_count=ChatSession.message_count + 2, updated_at=datetime.now(timezone.utc))
+            )
+            await db.flush()
+        except Exception:
+            pass
+
+    yield {"done": True, "session_id": session_id, "sources": sources}
+
+
+async def get_user_sessions(user_id: int, db: AsyncSession, page: int = 1, page_size: int = 20) -> list:
+    result = await db.execute(
+        select(ChatSession).where(ChatSession.user_id == user_id).order_by(ChatSession.updated_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    )
+    return result.scalars().all()
+
+
+async def get_session_messages(session_id: int, user_id: int, db: AsyncSession) -> list:
+    result = await db.execute(select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user_id))
+    if not result.scalar_one_or_none():
+        return []
+    result = await db.execute(
+        select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc())
+    )
+    return result.scalars().all()
+
+
+async def delete_session(session_id: int, user_id: int, db: AsyncSession) -> bool:
+    result = await db.execute(select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user_id))
+    session = result.scalar_one_or_none()
+    if session:
+        await db.delete(session)
+        return True
+    return False
