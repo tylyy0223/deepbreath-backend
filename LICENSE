@@ -1,0 +1,11 @@
+# frontend
+cd deepbreath-frontend
+git add LICENSE
+git commit -m "Add MIT License"
+git push
+
+# backend
+cd deepbreath-backend
+git add LICENSE
+git commit -m "Add MIT License"
+git push
