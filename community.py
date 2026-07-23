@@ -65,6 +65,11 @@ async def get_post(
     if not post:
         raise HTTPException(status_code=404, detail="帖子不存在")
 
+    # 浏览量 +1（异步）
+    await db.execute(
+        update(CommunityPost).where(CommunityPost.id == post_id).values(view_count=CommunityPost.view_count + 1)
+    )
+
     uid = current_user["user_id"] if current_user else None
 
     # 作者信息
@@ -128,6 +133,7 @@ async def get_post(
             "is_liked": is_liked,
             "like_count": post.like_count,
             "reply_count": post.reply_count,
+            "view_count": getattr(post, 'view_count', 0) or 0,
             "replies": reply_list,
             "created_at": post.created_at.isoformat() if post.created_at else None,
         },
@@ -175,7 +181,8 @@ async def list_posts(
     return {"code": 0, "data": [
         {"id": p.id, "title": p.title, "content": p.content[:500],
          "is_anonymous": p.is_anonymous, "like_count": p.like_count,
-         "reply_count": p.reply_count, "category": p.category,
+         "reply_count": p.reply_count, "view_count": getattr(p, 'view_count', 0) or 0,
+         "category": p.category,
          "author_id": p.author_id,
          "is_mine": uid is not None and p.author_id == uid,
          "is_liked": p.id in liked_ids,

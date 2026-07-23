@@ -12,6 +12,86 @@ from app.models.diary import MoodEntry  # noqa: E402
 router = APIRouter(prefix="/api/v1/diary", tags=["日记"])
 
 
+# ====== 每日签到 ======
+
+@router.post("/checkin")
+async def do_checkin(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """每日签到（关联心情日记，赠送 2 Credits）"""
+    from datetime import date as _date, timedelta as _td
+    from app.models.diary import CheckIn
+
+    user_id = current_user["user_id"]
+    today = _date.today()
+
+    # 今天是否已签到
+    r = await db.execute(
+        select(CheckIn).where(CheckIn.user_id == user_id, CheckIn.check_date == today)
+    )
+    existing = r.scalar_one_or_none()
+    if existing:
+        return {"code": 0, "data": {"checked": True, "streak": existing.streak_count, "message": "今日已签到"}}
+
+    # 计算连续天数
+    yesterday = today - _td(days=1)
+    r2 = await db.execute(
+        select(CheckIn).where(CheckIn.user_id == user_id, CheckIn.check_date == yesterday)
+    )
+    prev = r2.scalar_one_or_none()
+    streak = (prev.streak_count + 1) if prev else 1
+
+    # 记录签到
+    checkin = CheckIn(user_id=user_id, check_date=today, streak_count=streak)
+    db.add(checkin)
+
+    # 签到奖励 2 Credits
+    from app.services.credits_service import charge
+    try:
+        await charge(db, user_id, -2, ref=f"checkin:{today.isoformat()}", note="每日签到奖励")
+    except Exception:
+        pass
+
+    await db.flush()
+    return {"code": 0, "data": {"checked": True, "streak": streak, "reward": 2}}
+
+
+@router.get("/checkin/status")
+async def checkin_status(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """查询签到状态：今日是否已签、连续天数、本月签到日历"""
+    from datetime import date as _date, timedelta as _td
+    from app.models.diary import CheckIn
+
+    user_id = current_user["user_id"]
+    today = _date.today()
+
+    # 今日状态
+    r = await db.execute(
+        select(CheckIn).where(CheckIn.user_id == user_id, CheckIn.check_date == today)
+    )
+    today_checked = r.scalar_one_or_none()
+    streak = today_checked.streak_count if today_checked else 0
+
+    # 本月签到日期列表
+    month_start = today.replace(day=1)
+    r2 = await db.execute(
+        select(CheckIn.check_date)
+        .where(CheckIn.user_id == user_id, CheckIn.check_date >= month_start)
+        .order_by(CheckIn.check_date.asc())
+    )
+    month_dates = [str(row[0]) for row in r2.fetchall()]
+
+    return {"code": 0, "data": {
+        "checked_today": bool(today_checked),
+        "streak": streak,
+        "month_dates": month_dates,
+    }}
+
+
 class DiaryCreateRequest(BaseModel):
     mood_score: int = Field(..., ge=1, le=5)
     mood_label: str = ""
