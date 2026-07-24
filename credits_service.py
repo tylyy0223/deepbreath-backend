@@ -7,7 +7,7 @@ from app.models.credits import CreditTransaction
 PRICING = {
     "chat_science": 1,      # AI 对话 · 心理科普
     "chat_reading": 1,      # AI 对话 · 阅读模式
-    "chat_counseling": 2,   # AI 对话 · 心理咨询
+    "chat_counseling": 2,   # AI 对话 · 心理树洞
     "chat_assessment": 2,   # AI 对话 · 心理评估
     "tts": 15,              # TTS 语音朗读（缓存命中不扣）
     "email": 5,             # 邮件发送
@@ -16,7 +16,7 @@ PRICING = {
 
 PRICING_LABELS = [
     {"key": "chat_science", "label": "AI 对话 · 心理科普/阅读", "cost": 1, "unit": "条"},
-    {"key": "chat_counseling", "label": "AI 对话 · 心理咨询/评估", "cost": 2, "unit": "条"},
+    {"key": "chat_counseling", "label": "AI 对话 · 心理树洞/评估", "cost": 2, "unit": "条"},
     {"key": "tts", "label": "语音朗读（缓存命中免费）", "cost": 15, "unit": "次"},
     {"key": "email", "label": "邮件发送", "cost": 5, "unit": "封"},
     {"key": "scale", "label": "心理量表测评（SDS/SAS/SCL-90）", "cost": 20, "unit": "次"},
