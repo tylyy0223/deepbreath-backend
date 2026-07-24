@@ -1,15 +1,41 @@
-"""日记 API — 创建 / 列表 / 统计 / 详情 / 编辑 / 删除"""
+"""日记 API — 创建 / 列表 / 统计 / 详情 / 编辑 / 删除
+
+时间约定：所有「日」边界以 UTC+8（北京时间）00:00~24:00 为准；
+「周」边界以自然周 周一 00:00 ~ 周日 24:00 为准。
+"""
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from pydantic import BaseModel, Field
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.diary import MoodEntry  # noqa: E402
 
 router = APIRouter(prefix="/api/v1/diary", tags=["日记"])
+
+# 北京时间时区（UTC+8）
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def _today_cn() -> date:
+    """返回北京时间今天的日期"""
+    return datetime.now(CN_TZ).date()
+
+
+def _current_week_range():
+    """返回本周一 00:00:00 ~ 本周一 00:00:00（即下周一 00:00，作为右端点）
+
+    自然周定义：周一 00:00 ~ 周日 24:00（北京时间）
+    """
+    now = datetime.now(CN_TZ)
+    # 本周一 00:00:00
+    monday = now.date() - timedelta(days=now.weekday())
+    week_start = datetime(monday.year, monday.month, monday.day, 0, 0, 0, tzinfo=CN_TZ)
+    # 下周一 00:00:00（作为查询的右端点）
+    week_end = week_start + timedelta(days=7)
+    return week_start, week_end
 
 
 # ====== 每日签到 ======
@@ -19,12 +45,14 @@ async def do_checkin(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """每日签到（关联心情日记，赠送 2 Credits）"""
-    from datetime import date as _date, timedelta as _td
+    """每日签到（关联心情日记，赠送 2 Credits）
+
+    签到日边界：北京时间 00:00 ~ 24:00
+    """
     from app.models.diary import CheckIn
 
     user_id = current_user["user_id"]
-    today = _date.today()
+    today = _today_cn()
 
     # 今天是否已签到
     r = await db.execute(
@@ -35,7 +63,7 @@ async def do_checkin(
         return {"code": 0, "data": {"checked": True, "streak": existing.streak_count, "message": "今日已签到"}}
 
     # 计算连续天数
-    yesterday = today - _td(days=1)
+    yesterday = today - timedelta(days=1)
     r2 = await db.execute(
         select(CheckIn).where(CheckIn.user_id == user_id, CheckIn.check_date == yesterday)
     )
@@ -62,12 +90,14 @@ async def checkin_status(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """查询签到状态：今日是否已签、连续天数、本月签到日历"""
-    from datetime import date as _date, timedelta as _td
+    """查询签到状态：今日是否已签、连续天数、本月签到日历
+
+    签到日边界：北京时间 00:00 ~ 24:00
+    """
     from app.models.diary import CheckIn
 
     user_id = current_user["user_id"]
-    today = _date.today()
+    today = _today_cn()
 
     # 今日状态
     r = await db.execute(
@@ -163,11 +193,14 @@ async def diary_stats(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """日记统计（含连续天数、常见情绪、情绪分布）"""
-    from datetime import datetime, timezone, timedelta
+    """日记统计（含连续天数、常见情绪、情绪分布）
+
+    日边界：北京时间 00:00 ~ 24:00
+    """
+    from datetime import datetime, timezone as _tz, timedelta as _td
 
     user_id = current_user["user_id"]
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(CN_TZ) - _td(days=days)
 
     # 基础统计
     r = await db.execute(
@@ -178,11 +211,11 @@ async def diary_stats(
     )
     avg_mood, total = r.one()
 
-    # 连续记录天数：从今天往回数，直到遇到没有记录的那天
+    # 连续记录天数：从今天（北京时间）往回数，直到遇到没有记录的那天
     streak = 0
-    today = datetime.now(timezone.utc).date()
+    today = _today_cn()
     for i in range(365):
-        d = today - timedelta(days=i)
+        d = today - _td(days=i)
         cnt = (await db.execute(
             select(func.count(MoodEntry.id)).where(
                 MoodEntry.user_id == user_id,
@@ -300,17 +333,19 @@ async def weekly_report(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """近 7 天数据聚合：情绪走势、日记/呼吸统计（无 AI 总结）"""
-    from datetime import datetime, timezone, timedelta
+    """本周数据聚合：情绪走势、日记/呼吸统计（无 AI 总结）
+
+    周边界：自然周 周一 00:00 ~ 周日 24:00（北京时间）
+    """
     from app.models.breath import BreathSession
 
     user_id = current_user["user_id"]
-    since = datetime.now(timezone.utc) - timedelta(days=7)
+    since, until = _current_week_range()  # 本周一 00:00 ~ 下周一 00:00
 
-    # 情绪数据：近7天每日均分
+    # 情绪数据：本周每日均分
     mood_rows = (await db.execute(
         select(func.date(MoodEntry.created_at).label("d"), func.avg(MoodEntry.mood_score).label("avg"))
-        .where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since)
+        .where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since, MoodEntry.created_at < until)
         .group_by(func.date(MoodEntry.created_at))
         .order_by(func.date(MoodEntry.created_at))
     )).all()
@@ -322,14 +357,14 @@ async def weekly_report(
 
     # 日记总数
     diary_count = (await db.execute(
-        select(func.count(MoodEntry.id)).where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since)
+        select(func.count(MoodEntry.id)).where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since, MoodEntry.created_at < until)
     )).scalar() or 0
 
     # 呼吸统计
     breath_rows = (await db.execute(
         select(func.count(BreathSession.id), func.coalesce(func.sum(BreathSession.duration_sec), 0))
         .where(BreathSession.user_id == user_id, BreathSession.completed == True,  # noqa: E712
-               BreathSession.completed_at >= since)
+               BreathSession.completed_at >= since, BreathSession.completed_at < until)
     )).first()
 
     return {"code": 0, "data": {
@@ -338,4 +373,5 @@ async def weekly_report(
         "breath_count": breath_rows[0] or 0,
         "breath_minutes": round((breath_rows[1] or 0) / 60, 1),
         "week_start": since.isoformat(),
+        "week_end": until.isoformat(),
     }}
