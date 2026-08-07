@@ -166,6 +166,127 @@ async def diary_stats(
     }
 
 
+@router.get("/weekly-report")
+async def weekly_report(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """本周数据聚合：情绪、日记、呼吸、签到、AI 对话、Credits
+
+    周边界：自然周 周一 00:00 ~ 周日 24:00（北京时间）
+    """
+    from app.models.breath import BreathSession
+    from app.models.chat import ChatSession, ChatMessage
+    from app.models.checkin import CheckIn
+    from app.models.credits import CreditTransaction
+
+    user_id = current_user["user_id"]
+    since, until = _current_week_range()
+
+    # ---- 情绪趋势 ----
+    mood_rows = (await db.execute(
+        select(
+            func.date(MoodEntry.created_at).label("d"),
+            func.avg(MoodEntry.mood_score).label("avg"),
+        )
+        .where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since, MoodEntry.created_at < until)
+        .group_by(func.date(MoodEntry.created_at))
+        .order_by(func.date(MoodEntry.created_at))
+    )).all()
+    mood_trend = [
+        {"date": str(r.d), "avg_mood": round(float(r.avg), 1)}
+        for r in mood_rows
+    ]
+
+    diary_count = (await db.execute(
+        select(func.count(MoodEntry.id))
+        .where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since, MoodEntry.created_at < until)
+    )).scalar() or 0
+
+    breath_rows = (await db.execute(
+        select(
+            func.count(BreathSession.id),
+            func.coalesce(func.sum(BreathSession.duration_sec), 0),
+        )
+        .where(
+            BreathSession.user_id == user_id,
+            BreathSession.completed == True,  # noqa: E712
+            BreathSession.completed_at >= since,
+            BreathSession.completed_at < until,
+        )
+    )).first()
+
+    checkin_rows = (await db.execute(
+        select(
+            func.count(CheckIn.id),
+            func.coalesce(func.sum(CheckIn.credits_earned), 0),
+            func.max(CheckIn.streak_count),
+        )
+        .where(CheckIn.user_id == user_id, CheckIn.check_date >= since.date(), CheckIn.check_date < until.date())
+    )).first()
+
+    chat_mode_rows = (await db.execute(
+        select(
+            ChatSession.mode,
+            func.count(ChatSession.id).label("sessions"),
+            func.coalesce(func.sum(ChatSession.message_count), 0).label("messages"),
+        )
+        .where(ChatSession.user_id == user_id, ChatSession.created_at >= since, ChatSession.created_at < until)
+        .group_by(ChatSession.mode)
+    )).all()
+    chat_by_mode = [
+        {
+            "mode": r.mode,
+            "label": CHAT_MODE_LABELS.get(r.mode, r.mode),
+            "sessions": r.sessions,
+            "messages": r.messages,
+        }
+        for r in chat_mode_rows
+    ]
+    total_chat_sessions = sum(r.sessions for r in chat_mode_rows)
+    total_chat_messages = sum(r.messages for r in chat_mode_rows)
+
+    credit_earned = (await db.execute(
+        select(func.coalesce(func.sum(CreditTransaction.amount), 0))
+        .where(
+            CreditTransaction.user_id == user_id,
+            CreditTransaction.created_at >= since,
+            CreditTransaction.created_at < until,
+            CreditTransaction.amount > 0,
+        )
+    )).scalar() or 0
+
+    credit_spent = (await db.execute(
+        select(func.coalesce(func.sum(CreditTransaction.amount), 0))
+        .where(
+            CreditTransaction.user_id == user_id,
+            CreditTransaction.created_at >= since,
+            CreditTransaction.created_at < until,
+            CreditTransaction.amount < 0,
+        )
+    )).scalar() or 0
+
+    return {
+        "code": 0,
+        "data": {
+            "week_start": since.isoformat(),
+            "week_end": until.isoformat(),
+            "mood_trend": mood_trend,
+            "diary_count": diary_count,
+            "breath_count": breath_rows[0] or 0,
+            "breath_minutes": round((breath_rows[1] or 0) / 60, 1),
+            "checkin_days": checkin_rows[0] or 0,
+            "checkin_credits": checkin_rows[1] or 0,
+            "checkin_max_streak": checkin_rows[2] or 0,
+            "chat_by_mode": chat_by_mode,
+            "total_chat_sessions": total_chat_sessions,
+            "total_chat_messages": total_chat_messages,
+            "credit_earned": credit_earned,
+            "credit_spent": abs(credit_spent),
+        },
+    }
+
+
 @router.get("/{entry_id}")
 async def get_diary_entry(
     entry_id: int,
@@ -233,147 +354,3 @@ async def delete_diary_entry(
     return {"code": 0, "data": {"id": entry_id, "deleted": True}}
 
 
-# ====== 个人周报（增强版） ======
-
-CHAT_MODE_LABELS = {
-    "science": "心理科普",
-    "counseling": "心理树洞",
-    "assessment": "心理评估",
-    "reading": "阅读模式",
-}
-
-
-@router.get("/weekly-report")
-async def weekly_report(
-    current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """本周数据聚合：情绪、日记、呼吸、签到、AI 对话、Credits（无 AI 总结）
-
-    周边界：自然周 周一 00:00 ~ 周日 24:00（北京时间）
-    """
-    from app.models.breath import BreathSession
-    from app.models.chat import ChatSession, ChatMessage
-    from app.models.checkin import CheckIn
-    from app.models.credits import CreditTransaction
-
-    user_id = current_user["user_id"]
-    since, until = _current_week_range()
-
-    # ---- 情绪趋势 ----
-    mood_rows = (await db.execute(
-        select(
-            func.date(MoodEntry.created_at).label("d"),
-            func.avg(MoodEntry.mood_score).label("avg"),
-        )
-        .where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since, MoodEntry.created_at < until)
-        .group_by(func.date(MoodEntry.created_at))
-        .order_by(func.date(MoodEntry.created_at))
-    )).all()
-    mood_trend = [
-        {"date": str(r.d), "avg_mood": round(float(r.avg), 1)}
-        for r in mood_rows
-    ]
-
-    # ---- 日记 ----
-    diary_count = (await db.execute(
-        select(func.count(MoodEntry.id))
-        .where(MoodEntry.user_id == user_id, MoodEntry.created_at >= since, MoodEntry.created_at < until)
-    )).scalar() or 0
-
-    # ---- 呼吸 ----
-    breath_rows = (await db.execute(
-        select(
-            func.count(BreathSession.id),
-            func.coalesce(func.sum(BreathSession.duration_sec), 0),
-        )
-        .where(
-            BreathSession.user_id == user_id,
-            BreathSession.completed == True,  # noqa: E712
-            BreathSession.completed_at >= since,
-            BreathSession.completed_at < until,
-        )
-    )).first()
-
-    # ---- 签到 ----
-    checkin_rows = (await db.execute(
-        select(
-            func.count(CheckIn.id),
-            func.coalesce(func.sum(CheckIn.credits_earned), 0),
-            func.max(CheckIn.streak_count),
-        )
-        .where(CheckIn.user_id == user_id, CheckIn.check_date >= since.date(), CheckIn.check_date < until.date())
-    )).first()
-    checkin_days = checkin_rows[0] or 0
-    checkin_credits = checkin_rows[1] or 0
-    checkin_max_streak = checkin_rows[2] or 0
-
-    # ---- AI 对话（按模式统计） ----
-    chat_mode_rows = (await db.execute(
-        select(
-            ChatSession.mode,
-            func.count(ChatSession.id).label("sessions"),
-            func.coalesce(func.sum(ChatSession.message_count), 0).label("messages"),
-        )
-        .where(ChatSession.user_id == user_id, ChatSession.created_at >= since, ChatSession.created_at < until)
-        .group_by(ChatSession.mode)
-    )).all()
-    chat_by_mode = [
-        {
-            "mode": r.mode,
-            "label": CHAT_MODE_LABELS.get(r.mode, r.mode),
-            "sessions": r.sessions,
-            "messages": r.messages,
-        }
-        for r in chat_mode_rows
-    ]
-
-    # 总对话轮次（所有模式合计）
-    total_chat_sessions = sum(r.sessions for r in chat_mode_rows)
-    total_chat_messages = sum(r.messages for r in chat_mode_rows)
-
-    # ---- Credits 周汇总 ----
-    credit_earned = (await db.execute(
-        select(func.coalesce(func.sum(CreditTransaction.amount), 0))
-        .where(
-            CreditTransaction.user_id == user_id,
-            CreditTransaction.created_at >= since,
-            CreditTransaction.created_at < until,
-            CreditTransaction.amount > 0,
-        )
-    )).scalar() or 0
-
-    credit_spent = (await db.execute(
-        select(func.coalesce(func.sum(CreditTransaction.amount), 0))
-        .where(
-            CreditTransaction.user_id == user_id,
-            CreditTransaction.created_at >= since,
-            CreditTransaction.created_at < until,
-            CreditTransaction.amount < 0,
-        )
-    )).scalar() or 0
-
-    return {
-        "code": 0,
-        "data": {
-            "week_start": since.isoformat(),
-            "week_end": until.isoformat(),
-            # 情绪
-            "mood_trend": mood_trend,
-            "diary_count": diary_count,
-            # 呼吸
-            "breath_count": breath_rows[0] or 0,
-            "breath_minutes": round((breath_rows[1] or 0) / 60, 1),
-            # 签到
-            "checkin_days": checkin_days,
-            "checkin_credits": checkin_credits,
-            "checkin_max_streak": checkin_max_streak,
-            # AI 对话
-            "chat_by_mode": chat_by_mode,
-            "total_chat_sessions": total_chat_sessions,
-            "total_chat_messages": total_chat_messages,
-            # Credits
-            "credit_earned": credit_earned,
-            "credit_spent": abs(credit_spent),
-        },
-    }
