@@ -4,6 +4,18 @@
 >
 > DeepBreath 深呼吸后端服务：FastAPI + PostgreSQL + Redis + AI。
 
+
+
+<div align="center">
+
+## ⭐ **喜欢这个项目吗？请给我们一个 Star！** ⭐
+
+[![Star on GitHub](https://img.shields.io/github/stars/tylyy0223/deepbreath-backend?style=for-the-badge&logo=github&labelColor=black&color=f7df1e)](https://github.com/tylyy0223/deepbreath-backend)
+
+<sub>你的 Star 是对我们最大的鼓励，也能让更多人发现这个项目 🚀</sub>
+
+</div>
+
 ---
 
 ## 🛠 Tech Stack · 技术栈
