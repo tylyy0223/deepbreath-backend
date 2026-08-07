@@ -1,7 +1,7 @@
-"""管理后台 API — 用户管理、数据统计"""
+"""管理后台 API — 用户管理、数据统计、用户地理分布"""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, and_
 from datetime import datetime, timezone, timedelta
 from app.core.database import get_db
 from app.core.security import get_current_user, require_role, Roles
@@ -28,6 +28,20 @@ async def get_stats(
     )
     active_today = r2.scalar() or 0
 
+    # 登录用户地理分布概览
+    from app.models.cache import LoginLog
+    r3 = await db.execute(
+        select(func.count(func.distinct(LoginLog.province)))
+        .where(LoginLog.success == True, LoginLog.province != "")  # noqa: E712
+    )
+    province_count = r3.scalar() or 0
+
+    r4 = await db.execute(
+        select(func.count(func.distinct(LoginLog.city)))
+        .where(LoginLog.success == True, LoginLog.city != "")  # noqa: E712
+    )
+    city_count = r4.scalar() or 0
+
     return {
         "code": 0,
         "data": {
@@ -35,6 +49,10 @@ async def get_stats(
             "active_today": active_today,
             "total_articles": 0,
             "total_posts": 0,
+            "regions": {
+                "provinces": province_count,
+                "cities": city_count,
+            },
         },
     }
 
@@ -122,7 +140,7 @@ async def get_login_logs(
     current_user: dict = Depends(require_role(Roles.ADMIN)),
     db: AsyncSession = Depends(get_db),
 ):
-    """查看用户登录日志"""
+    """查看用户登录日志（含 IP 地理位置）"""
     from app.models.cache import LoginLog
     q = select(LoginLog)
     if user_id:
@@ -142,11 +160,197 @@ async def get_login_logs(
         "data": [{
             "id": l.id, "user_id": l.user_id, "email": l.email,
             "action": l.action, "success": l.success,
-            "ip_address": l.ip_address, "user_agent": l.user_agent[:200] if l.user_agent else "",
+            "ip_address": l.ip_address,
+            "country": l.country, "province": l.province, "city": l.city,
+            "user_agent": l.user_agent[:200] if l.user_agent else "",
             "detail": l.detail,
             "created_at": l.created_at.isoformat() if l.created_at else None,
         } for l in logs],
         "total": total, "page": page, "page_size": page_size,
+    }
+
+
+# ---- 用户地理分布统计 ----
+
+@router.get("/user-distribution")
+async def user_distribution(
+    by: str = "province",  # province | city | country
+    days: int = 0,         # 0 = 全部，>0 = 最近 N 天
+    current_user: dict = Depends(require_role(Roles.EDITOR)),
+    db: AsyncSession = Depends(get_db),
+):
+    """用户地理分布统计 —— 按省份/城市/国家统计成功登录的唯一用户数
+
+    Args:
+        by: 统计维度 — province（省份）、city（城市）、country（国家）
+        days: 时间范围，0 表示全部历史，>0 表示最近 N 天
+    """
+    from app.models.cache import LoginLog
+
+    column_map = {
+        "province": LoginLog.province,
+        "city": LoginLog.city,
+        "country": LoginLog.country,
+    }
+    if by not in column_map:
+        raise HTTPException(status_code=400, detail="by 参数无效，可选：province, city, country")
+
+    col = column_map[by]
+
+    # 每个区域只计唯一用户（同一用户多次登录算一次）
+    q = (
+        select(
+            col.label("region"),
+            func.count(func.distinct(LoginLog.user_id)).label("user_count"),
+            func.count(LoginLog.id).label("login_count"),
+        )
+        .where(
+            LoginLog.success == True,  # noqa: E712
+            LoginLog.user_id.isnot(None),
+            col != "",
+        )
+    )
+
+    if days > 0:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        q = q.where(LoginLog.created_at >= since)
+
+    q = q.group_by(col).order_by(text("user_count DESC"))
+
+    r = await db.execute(q)
+    rows = r.all()
+
+    # 计算占比
+    total_users = sum(row.user_count for row in rows)
+    data = [
+        {
+            "region": row.region,
+            "user_count": row.user_count,
+            "login_count": row.login_count,
+            "percentage": round(row.user_count / total_users * 100, 1) if total_users > 0 else 0,
+        }
+        for row in rows
+    ]
+
+    return {
+        "code": 0,
+        "data": {
+            "by": by,
+            "days": days if days > 0 else "all",
+            "total_regions": len(data),
+            "total_users": total_users,
+            "distribution": data,
+        },
+    }
+
+
+@router.get("/ip-stats")
+async def ip_stats(
+    days: int = 30,
+    current_user: dict = Depends(require_role(Roles.EDITOR)),
+    db: AsyncSession = Depends(get_db),
+):
+    """IP 统计概览 —— 登录热力数据
+
+    返回：总览 + 各省份登录用户数 + 每日登录趋势（按省份分组）
+    """
+    from app.models.cache import LoginLog
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # 省份分布 Top 20
+    r = await db.execute(
+        select(
+            LoginLog.province,
+            func.count(func.distinct(LoginLog.user_id)).label("users"),
+            func.count(LoginLog.id).label("logins"),
+        )
+        .where(
+            LoginLog.success == True,  # noqa: E712
+            LoginLog.province != "",
+            LoginLog.user_id.isnot(None),
+        )
+        .group_by(LoginLog.province)
+        .order_by(text("users DESC"))
+        .limit(20)
+    )
+    top_provinces = [
+        {"province": row.province, "users": row.users, "logins": row.logins}
+        for row in r.all()
+    ]
+
+    # 城市分布 Top 30
+    r = await db.execute(
+        select(
+            LoginLog.city,
+            func.count(func.distinct(LoginLog.user_id)).label("users"),
+            func.count(LoginLog.id).label("logins"),
+        )
+        .where(
+            LoginLog.success == True,  # noqa: E712
+            LoginLog.city != "",
+            LoginLog.user_id.isnot(None),
+        )
+        .group_by(LoginLog.city)
+        .order_by(text("users DESC"))
+        .limit(30)
+    )
+    top_cities = [
+        {"city": row.city, "users": row.users, "logins": row.logins}
+        for row in r.all()
+    ]
+
+    # 每日登录趋势（近 N 天）
+    r = await db.execute(
+        select(
+            func.date(LoginLog.created_at).label("d"),
+            func.count(func.distinct(LoginLog.user_id)).label("users"),
+            func.count(LoginLog.id).label("logins"),
+        )
+        .where(
+            LoginLog.success == True,  # noqa: E712
+            LoginLog.created_at >= since,
+        )
+        .group_by(text("d"))
+        .order_by(text("d"))
+    )
+    daily = [
+        {"date": str(row.d), "users": row.users, "logins": row.logins}
+        for row in r.all()
+    ]
+
+    # 新地区发现趋势（每天新出现的省份数）
+    r = await db.execute(
+        select(
+            func.date(LoginLog.created_at).label("d"),
+            func.count(func.distinct(LoginLog.province)).label("new_provinces"),
+            func.count(func.distinct(LoginLog.city)).label("new_cities"),
+        )
+        .where(
+            LoginLog.success == True,  # noqa: E712
+            LoginLog.created_at >= since,
+        )
+        .group_by(text("d"))
+        .order_by(text("d"))
+    )
+    daily_regions = [
+        {
+            "date": str(row.d),
+            "provinces": row.new_provinces,
+            "cities": row.new_cities,
+        }
+        for row in r.all()
+    ]
+
+    return {
+        "code": 0,
+        "data": {
+            "period_days": days,
+            "top_provinces": top_provinces,
+            "top_cities": top_cities,
+            "daily_logins": daily,
+            "daily_regions": daily_regions,
+        },
     }
 
 
