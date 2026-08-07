@@ -21,6 +21,7 @@ from app.schemas.auth import (
 from app.services.sms_service import (
     valid_phone, mask_phone, send_code, verify_code,
 )
+from ip_service import ip_to_location
 
 router = APIRouter(prefix="/api/v1/auth", tags=["认证"])
 
@@ -61,10 +62,20 @@ def _get_ip(request: Request) -> str:
 
 async def _log_login(user_id: int | None, email: str, action: str, success: bool, request: Request, detail: str = ""):
     try:
+        ip = _get_ip(request)
+        # 解析 IP 地理位置（失败不影响日志记录）
+        try:
+            loc = await ip_to_location(ip)
+        except Exception:
+            loc = {"country": "", "province": "", "city": ""}
+
         db = async_session()
         db.add(LoginLog(
             user_id=user_id, email=email, action=action, success=success,
-            ip_address=_get_ip(request),
+            ip_address=ip,
+            country=loc.get("country", ""),
+            province=loc.get("province", ""),
+            city=loc.get("city", ""),
             user_agent=(request.headers.get("User-Agent", "") or "")[:500],
             detail=detail,
         ))
