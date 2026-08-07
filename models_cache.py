@@ -77,7 +77,7 @@ class UserAudioCache(Base):
 
 
 class LoginLog(Base):
-    """用户登录日志"""
+    """用户登录日志 — 含 IP 地理位置"""
     __tablename__ = "login_logs"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -86,8 +86,11 @@ class LoginLog(Base):
     action: Mapped[str] = mapped_column(String(20), nullable=False)  # login / register / logout
     success: Mapped[bool] = mapped_column(default=True)
     ip_address: Mapped[str] = mapped_column(String(45), default="")
+    country: Mapped[str] = mapped_column(String(50), default="")     # IP 归属国家
+    province: Mapped[str] = mapped_column(String(50), default="")    # IP 归属省份
+    city: Mapped[str] = mapped_column(String(50), default="")        # IP 归属城市
     user_agent: Mapped[str] = mapped_column(String(500), default="")
-    detail: Mapped[str] = mapped_column(String(200), default="")  # 失败原因等
+    detail: Mapped[str] = mapped_column(String(200), default="")     # 失败原因等
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
 
 
