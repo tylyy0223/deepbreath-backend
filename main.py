@@ -72,6 +72,7 @@ from app.api.v1 import admin as admin_router
 from app.api.v1 import content as content_router
 from app.api.v1 import breath as breath_router
 from app.api.v1 import diary as diary_router
+from app.api.v1 import checkin as checkin_router
 from app.api.v1 import community as community_router
 from app.api.v1 import tts as tts_router
 from app.api.v1 import email_api as email_router
@@ -85,6 +86,7 @@ app.include_router(admin_router.router, tags=["管理后台"])
 app.include_router(content_router.router, tags=["科普内容"])
 app.include_router(breath_router.router, tags=["呼吸练习"])
 app.include_router(diary_router.router, tags=["情绪日记"])
+app.include_router(checkin_router.router, tags=["签到"])
 app.include_router(community_router.router, tags=["社区"])
 app.include_router(tts_router.router, tags=["TTS"])
 app.include_router(email_router.router, tags=["邮件"])
