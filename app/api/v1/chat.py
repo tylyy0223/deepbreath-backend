@@ -356,6 +356,43 @@ async def remove_session(session_id: int, current_user: dict = Depends(get_curre
         await db.close()
 
 
+@router.delete("/messages/{message_id}")
+async def remove_message(message_id: int, current_user: dict = Depends(get_current_user)):
+    """删除单条消息（仅允许删除属于自己的消息，并更新会话计数）"""
+    db = async_session()
+    try:
+        r = await db.execute(
+            select(ChatMessage)
+            .join(ChatSession, ChatMessage.session_id == ChatSession.id)
+            .where(ChatMessage.id == message_id, ChatSession.user_id == current_user["user_id"])
+        )
+        msg = r.scalar_one_or_none()
+        if not msg:
+            raise HTTPException(status_code=404, detail="消息不存在或无权删除")
+
+        session_id = msg.session_id
+        await db.delete(msg)
+
+        # 更新会话消息计数
+        cnt = await db.execute(select(ChatMessage.id).where(ChatMessage.session_id == session_id))
+        remaining = len(cnt.fetchall())
+        await db.execute(
+            update(ChatSession)
+            .where(ChatSession.id == session_id)
+            .values(message_count=remaining, updated_at=datetime.now(timezone.utc))
+        )
+
+        await db.commit()
+        return {"code": 0, "message": "已删除", "data": {"session_id": session_id, "remaining": remaining}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await db.close()
+
+
 # ====== P1-#12: 异步 RAG 推荐文章 ======
 
 @router.get("/sessions/{session_id}/related")
