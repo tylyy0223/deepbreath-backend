@@ -1,0 +1,41 @@
+# FastAPI 核心
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.18
+
+# 数据库
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# Redis
+redis==5.2.1
+
+# 认证
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.1
+
+# 数据校验
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# HTTP 客户端
+httpx==0.28.1
+aiohttp==3.11.10
+
+# 后台任务
+celery[redis]==5.4.0
+
+# 邮件
+aiosmtplib==3.0.2
+
+# TTS
+edge-tts==6.1.14
+
+# 日志
+loguru==0.7.2
+
+# 工具
+aiofiles==24.1.0

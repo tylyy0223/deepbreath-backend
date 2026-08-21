@@ -1,0 +1,35 @@
+# ========== 敏感文件（严禁入库） ==========
+.env
+.env.*
+*.key
+*.pem
+*.p12
+key.properties
+keystore
+*.jks
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ========== Node / 前端 ==========
+node_modules/
+dist/
+build/
+.next/
+
+# ========== 日志 & 缓存 ==========
+*.log
+logs/
+*.sqlite
+*.db
+.cache/
+
+# ========== 系统 ==========
+.DS_Store
+Thumbs.db

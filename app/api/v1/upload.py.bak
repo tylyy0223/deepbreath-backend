@@ -1,0 +1,37 @@
+"""文件上传 API — 图片上传（供日记贴图等使用）"""
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from pathlib import Path
+import uuid
+import os
+
+router = APIRouter(prefix="/api/v1/upload", tags=["文件上传"])
+
+# 上传配置
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/data/deepbreath/uploads")
+MAX_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "10"))
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "heic", "heif"}
+
+
+@router.post("/image")
+async def upload_image(file: UploadFile = File(...)):
+    """上传单张图片，返回可访问的图片 URL"""
+    # 校验扩展名
+    ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式：{ext}。支持：{', '.join(sorted(ALLOWED_EXTENSIONS))}")
+
+    # 读取内容并校验大小
+    contents = await file.read()
+    if len(contents) > MAX_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"文件大小超过 {MAX_SIZE_MB}MB 限制")
+
+    # 生成唯一文件名
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    save_dir = Path(UPLOAD_DIR)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / filename
+    save_path.write_bytes(contents)
+
+    # 返回可访问 URL（通过 nginx 静态文件路径）
+    url = f"/uploads/{filename}"
+    return {"code": 0, "data": {"url": url, "filename": filename}}
