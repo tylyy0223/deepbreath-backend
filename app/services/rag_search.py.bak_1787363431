@@ -120,7 +120,7 @@ def search_wiki(query, limit=5):
         params.append(lim)
         sql = f"""
             SELECT id, title, description,
-                   content AS content_preview,
+                   LEFT(content, 800) AS content_preview,
                    path, "localeCode", tree_title,
                    ({score_expr}) AS score
             FROM v_psy_chat_pages
@@ -168,7 +168,7 @@ def search_wiki(query, limit=5):
         if title in seen_titles:
             continue
         seen_titles.add(title)
-        content = (row.get("content_preview") or "")[:800]
+        content = row.get("content_preview") or ""
         clean = re.sub(r"<[^>]+>", "", content)[:600]
         path = row.get("path") or ""
         locale = row.get("localeCode") or "zh"

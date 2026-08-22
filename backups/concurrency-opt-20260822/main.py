@@ -1,6 +1,6 @@
 """深呼吸 DeepBreath — FastAPI 应用入口"""
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
@@ -31,31 +31,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.middleware("http")
-async def track_online_users(request: Request, call_next):
-    """在线用户追踪：带有效 access token 的 /api/v1 请求刷新 online:{user_id}（5 分钟窗口）
-
-    供管理后台「并发用户监控」使用；JWT 本地解码，无 DB 查询，开销 <1ms。
-    """
-    try:
-        if request.url.path.startswith("/api/v1"):
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                from app.core.security import decode_token
-                from app.core.redis import redis_client
-                payload = decode_token(auth[7:].strip())
-                if payload and payload.get("type") == "access":
-                    uid = int(payload["sub"])
-                    await redis_client.set(
-                        f"online:{uid}",
-                        int(__import__("time").time()),
-                        ex=300,
-                    )
-    except Exception:
-        pass
-    return await call_next(request)
 
 # API 响应格式统一（P1-#7：非 stream 的 200 响应自动包装 {code,message,data}）
 # P1-#7 API 中间件暂禁用排查登录问题

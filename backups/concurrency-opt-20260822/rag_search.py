@@ -1,10 +1,5 @@
-"""Wiki.js 知识库搜索（分词版 + 连接池）
-
-- 检索质量：中文分词 OR 匹配（4 字词优先）+ 两级检索（title 快层 → content 兜底）
-- 性能：ThreadedConnectionPool 复用连接，替代每请求新建连接（压测 20 并发 48ms）
-"""
+"""Wiki.js 知识库搜索"""
 import os, re, psycopg2, psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
 
 from app.services.env import ensure_env  # 统一 env 加载，消除重复的 _load_env_fallback
 
@@ -14,27 +9,6 @@ WIKI_BASE_URL = "https://luoyuyu.cn"
 
 # 中文查询无空格分词，用常见分隔符拆分；英文按空格拆分
 _SPLIT_RE = re.compile(r"[\s,，。.;；、!！?？:：'\"()（）\[\]【】]+")
-
-# 连接池（线程安全；search_wiki 经 asyncio.to_thread 在线程池执行）
-# minconn=1 惰性建立，maxconn=10 覆盖并发峰值（PG 100 上限内）
-_POOL = None
-
-
-def _get_pool():
-    global _POOL
-    if _POOL is None:
-        _POOL = ThreadedConnectionPool(
-            1, 10,
-            host=os.environ.get("WIKI_DB_HOST", "127.0.0.1"),
-            port=int(os.environ.get("WIKI_DB_PORT", "5432")),
-            dbname=os.environ.get("WIKI_DB_NAME", "wikijs"),
-            user=os.environ.get("WIKI_DB_USER", "deepbreath_wiki_reader"),
-            password=os.environ.get("WIKI_DB_PASSWORD", ""),
-            connect_timeout=3,
-            # 服务器 locale 可能是 POSIX/ASCII，必须显式 UTF8 否则中文查询报编码错
-            client_encoding="UTF8",
-        )
-    return _POOL
 
 
 def _tokenize(query: str) -> list[str]:
@@ -120,7 +94,7 @@ def search_wiki(query, limit=5):
         params.append(lim)
         sql = f"""
             SELECT id, title, description,
-                   content AS content_preview,
+                   LEFT(content, 800) AS content_preview,
                    path, "localeCode", tree_title,
                    ({score_expr}) AS score
             FROM v_psy_chat_pages
@@ -130,9 +104,15 @@ def search_wiki(query, limit=5):
         """
         return sql, params
 
-    conn = None
     try:
-        conn = _get_pool().getconn()
+        conn = psycopg2.connect(
+            host=os.environ.get("WIKI_DB_HOST", "127.0.0.1"),
+            port=int(os.environ.get("WIKI_DB_PORT", "5432")),
+            dbname=os.environ.get("WIKI_DB_NAME", "wikijs"),
+            user=os.environ.get("WIKI_DB_USER", "deepbreath_wiki_reader"),
+            password=os.environ.get("WIKI_DB_PASSWORD", ""),
+            connect_timeout=3,
+        )
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
         # 第一级：仅 title 匹配（title 列小，全 token OR 也快；覆盖核心词）
@@ -155,11 +135,9 @@ def search_wiki(query, limit=5):
                     break
 
         cur.close()
+        conn.close()
     except Exception as e:
         return {"error": str(e), "results": [], "total": 0, "query": query}
-    finally:
-        if conn is not None:
-            _get_pool().putconn(conn)
 
     results = []
     seen_titles = set()
@@ -168,7 +146,7 @@ def search_wiki(query, limit=5):
         if title in seen_titles:
             continue
         seen_titles.add(title)
-        content = (row.get("content_preview") or "")[:800]
+        content = row.get("content_preview") or ""
         clean = re.sub(r"<[^>]+>", "", content)[:600]
         path = row.get("path") or ""
         locale = row.get("localeCode") or "zh"

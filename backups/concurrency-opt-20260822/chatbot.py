@@ -36,16 +36,6 @@ def _extract_error(resp) -> str:
         return f"DeepSeek API {resp.status_code}: {resp.text[:300]}"
 
 
-async def _record_429(resp) -> None:
-    """DeepSeek 429 限流：写日志 + Redis 计数器（管理后台并发监控可读）"""
-    try:
-        from app.core.redis import redis_client
-        await redis_client.incr("stats:deepseek:429")
-    except Exception:
-        pass
-    logger.error("[deepseek] 429 限流触发: %s", _extract_error(resp))
-
-
 async def chat_stream(messages, system_prompt=None, temperature=0.5):
     """
     流式调用 DeepSeek V4 API。
@@ -76,8 +66,6 @@ async def chat_stream(messages, system_prompt=None, temperature=0.5):
                 ) as resp:
                     if resp.status_code != 200:
                         await resp.aread()
-                        if resp.status_code == 429:
-                            await _record_429(resp)
                         err_msg = _extract_error(resp)
                         logger.error("[chat_stream] %s", err_msg)
                         raise Exception(err_msg)
@@ -127,8 +115,6 @@ async def chat_once(messages, temperature=0.5):
             },
         )
         if resp.status_code != 200:
-            if resp.status_code == 429:
-                await _record_429(resp)
             err_msg = _extract_error(resp)
             logger.error("[chat_once] %s", err_msg)
             raise Exception(err_msg)

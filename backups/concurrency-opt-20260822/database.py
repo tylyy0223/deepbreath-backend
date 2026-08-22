@@ -6,10 +6,8 @@ from app.core.config import settings
 _url = settings.DATABASE_URL
 _engine_kw = {"echo": settings.DEBUG}
 if _url.startswith("postgresql"):
-    # 多 worker 部署下连接池按 worker 数收缩（PG max_connections=100）：
-    # 每 worker (10+15)=25 × 2 workers = 50，留足余量给 RAG 池与其他服务
-    _engine_kw["pool_size"] = 10
-    _engine_kw["max_overflow"] = 15
+    _engine_kw["pool_size"] = 20
+    _engine_kw["max_overflow"] = 40
     _engine_kw["pool_pre_ping"] = True
 engine = create_async_engine(_url, **_engine_kw)
 

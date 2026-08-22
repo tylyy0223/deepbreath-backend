@@ -1,5 +1,5 @@
 """AI 对话 API — 流式响应 + Redis 缓存 + QA 缓存"""
-import json, sys, asyncio, hashlib, re, os
+import json, sys, asyncio, hashlib, re
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -12,18 +12,13 @@ from app.services.rag_search import search_wiki
 
 from app.core.database import async_session, get_db
 from app.core.security import get_current_user
-from app.core.redis import redis_client, check_rate_limit
+from app.core.redis import redis_client
 from app.models.chat import ChatSession, ChatMessage
 from app.models.cache import QACache
 from app.services.chat_service import MODE_CONFIG, get_user_sessions, get_session_messages, delete_session
 from app.services.credits_service import chat_cost, get_balance, charge
 
 router = APIRouter(prefix="/api/v1/chat", tags=["AI对话"])
-
-# 防滥用限流：每用户每分钟最多发 CHAT_RATE_LIMIT_PER_MIN 条（.env 可调，默认 20）
-CHAT_RATE_LIMIT_PER_MIN = int(os.environ.get("CHAT_RATE_LIMIT_PER_MIN", "20"))
-# 在线用户窗口（管理后台并发监控：任一 API 请求刷新此窗口）
-ONLINE_WINDOW_SECONDS = 300
 
 
 class ChatRequest(BaseModel):
@@ -107,20 +102,6 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
     full_response = ""
     cost = chat_cost(req.mode)
 
-    # 防滥用限流：每用户每分钟最多 N 条（超出返回 429，前端显示提示）
-    if not await check_rate_limit(f"chat:rl:{user_id}", CHAT_RATE_LIMIT_PER_MIN, 60):
-        try:
-            await redis_client.incr("stats:chat:rate_limited")
-        except Exception:
-            pass
-        raise HTTPException(status_code=429, detail=f"发送太频繁，请稍等片刻再试（每分钟最多 {CHAT_RATE_LIMIT_PER_MIN} 条）")
-
-    # 在线追踪：任意聊天请求刷新在线窗口（管理后台并发监控数据源）
-    try:
-        await redis_client.set(f"online:{user_id}", int(datetime.now(timezone.utc).timestamp()), ex=ONLINE_WINDOW_SECONDS)
-    except Exception:
-        pass
-
     # 余额预检：不足直接 402（缓存命中不扣费，但预检保证扣费点不会透支）
     if await get_balance(db, user_id) < cost:
         raise HTTPException(status_code=402, detail=f"Credits 余额不足（本次对话需 {cost} Credits），请充值后再试")
@@ -129,11 +110,6 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
         nonlocal full_response
         db = async_session()
         session_id = req.session_id
-        # 标记用户正在 AI 对话中（流结束清除）——管理后台"当前 AI 并发"数据源
-        try:
-            await redis_client.set(f"ai_active:{user_id}", int(datetime.now(timezone.utc).timestamp()), ex=120)
-        except Exception:
-            pass
         try:
             if not session_id:
                 s = ChatSession(user_id=user_id, mode=req.mode)
@@ -330,11 +306,6 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
             await db.rollback()
             yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
         finally:
-            # 清除 AI 对话中标记（流结束/中断）
-            try:
-                await redis_client.delete(f"ai_active:{user_id}")
-            except Exception:
-                pass
             await db.close()
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson",
@@ -381,6 +352,43 @@ async def remove_session(session_id: int, current_user: dict = Depends(get_curre
         if not ok: raise HTTPException(status_code=404, detail="会话不存在")
         await db.commit()
         return {"code": 0, "message": "已删除"}
+    finally:
+        await db.close()
+
+
+@router.delete("/messages/{message_id}")
+async def remove_message(message_id: int, current_user: dict = Depends(get_current_user)):
+    """删除单条消息（仅允许删除属于自己的消息，并更新会话计数）"""
+    db = async_session()
+    try:
+        r = await db.execute(
+            select(ChatMessage)
+            .join(ChatSession, ChatMessage.session_id == ChatSession.id)
+            .where(ChatMessage.id == message_id, ChatSession.user_id == current_user["user_id"])
+        )
+        msg = r.scalar_one_or_none()
+        if not msg:
+            raise HTTPException(status_code=404, detail="消息不存在或无权删除")
+
+        session_id = msg.session_id
+        await db.delete(msg)
+
+        # 更新会话消息计数
+        cnt = await db.execute(select(ChatMessage.id).where(ChatMessage.session_id == session_id))
+        remaining = len(cnt.fetchall())
+        await db.execute(
+            update(ChatSession)
+            .where(ChatSession.id == session_id)
+            .values(message_count=remaining, updated_at=datetime.now(timezone.utc))
+        )
+
+        await db.commit()
+        return {"code": 0, "message": "已删除", "data": {"session_id": session_id, "remaining": remaining}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         await db.close()
 

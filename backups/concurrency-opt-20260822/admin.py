@@ -5,91 +5,9 @@ from sqlalchemy import select, func, text
 from datetime import datetime, timezone, timedelta
 from app.core.database import get_db
 from app.core.security import get_current_user, require_role, Roles
-from app.core.redis import redis_client
 from app.models.user import User
 
 router = APIRouter(prefix="/api/v1/admin", tags=["管理后台"])
-
-
-@router.get("/online")
-async def online_monitor(
-    current_user: dict = Depends(require_role(Roles.ADMIN)),
-    db: AsyncSession = Depends(get_db),
-):
-    """并发用户实时监控：在线用户 + AI 对话中 + DeepSeek 429 / 限流拦截计数"""
-    now = int(datetime.now(timezone.utc).timestamp())
-
-    # 在线用户（middleware + chat 接口刷新 online:{user_id}，5 分钟窗口）
-    try:
-        online_keys = await redis_client.keys("online:*")
-    except Exception:
-        online_keys = []
-    online: list[dict] = []
-    for k in online_keys:
-        uid = k.split(":", 1)[1]
-        try:
-            uid_int = int(uid)
-        except ValueError:
-            continue
-        try:
-            last_active = int(await redis_client.get(k) or 0)
-        except Exception:
-            last_active = 0
-        online.append({"user_id": uid_int, "last_active_ts": last_active})
-
-    # 当前 AI 对话中用户（chat 流式进行中，ai_active:{user_id}）
-    try:
-        ai_keys = await redis_client.keys("ai_active:*")
-    except Exception:
-        ai_keys = []
-    ai_active_ids = set()
-    for k in ai_keys:
-        try:
-            ai_active_ids.add(int(k.split(":", 1)[1]))
-        except ValueError:
-            continue
-
-    # 用户信息
-    users_map: dict[int, User] = {}
-    if online:
-        r = await db.execute(
-            select(User).where(User.id.in_([u["user_id"] for u in online]))
-        )
-        users_map = {u.id: u for u in r.scalars().all()}
-
-    user_list = []
-    for item in online:
-        uid = item["user_id"]
-        u = users_map.get(uid)
-        user_list.append({
-            "user_id": uid,
-            "email": u.email if u else "",
-            "nickname": u.nickname if u else "",
-            "role": u.role if u else "",
-            "last_active_seconds_ago": max(0, now - item["last_active_ts"]),
-            "ai_active": uid in ai_active_ids,
-        })
-    user_list.sort(key=lambda x: (x["ai_active"], x["last_active_seconds_ago"]))
-
-    # 计数（自上次重启累计；429 计数器由 chatbot.py 递增）
-    async def _counter(key: str) -> int:
-        try:
-            v = await redis_client.get(key)
-            return int(v) if v else 0
-        except Exception:
-            return 0
-
-    return {
-        "code": 0,
-        "data": {
-            "online_count": len(user_list),
-            "ai_active_count": len(ai_active_ids),
-            "deepseek_429_total": await _counter("stats:deepseek:429"),
-            "chat_rate_limited_total": await _counter("stats:chat:rate_limited"),
-            "window_seconds": 300,
-            "users": user_list,
-        },
-    }
 
 
 @router.get("/stats")
