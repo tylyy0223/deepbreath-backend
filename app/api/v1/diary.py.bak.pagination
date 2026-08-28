@@ -101,51 +101,23 @@ async def create_diary(
 
 @router.get("/list")
 async def list_diary(
-    days: int = Query(default=0, ge=0, le=365),
+    days: int = Query(default=7, ge=1, le=365),
     search: str = Query(default=""),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """日记列表（分页，按时间倒序）。
-
-    - days=0 表示不限时间范围，全部记录分页查询（翻页可查历史）
-    - days>0 仅查最近 N 天
-    - search 按 note / mood_label 模糊匹配，分页同样生效
-    返回 {code, data: {items, total, page, page_size, pages, has_more}}
-    """
+    """获取最近 N 天的日记列表，支持按关键词搜索 note 和 mood_label"""
     q = select(MoodEntry).where(MoodEntry.user_id == current_user["user_id"])
-    if days and days > 0:
-        since = datetime.now(CN_TZ) - timedelta(days=days)
-        q = q.where(MoodEntry.created_at >= since)
+    await db.execute(text("SET TIME ZONE 'Asia/Shanghai'"))
     if search:
         pattern = f"%{search}%"
         q = q.where(
             MoodEntry.note.ilike(pattern) | MoodEntry.mood_label.ilike(pattern)
         )
-    # 总数（分页元数据）
-    total = (
-        await db.execute(select(func.count()).select_from(q.subquery()))
-    ).scalar() or 0
-    r = await db.execute(
-        q.order_by(MoodEntry.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
+    q = q.order_by(MoodEntry.created_at.desc()).limit(days * 5)
+    r = await db.execute(q)
     entries = r.scalars().all()
-    pages = (total + page_size - 1) // page_size if total else 0
-    return {
-        "code": 0,
-        "data": {
-            "items": [_entry_json(e) for e in entries],
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "pages": pages,
-            "has_more": page < pages,
-        },
-    }
+    return {"code": 0, "data": [_entry_json(e) for e in entries]}
 
 
 @router.get("/stats")
