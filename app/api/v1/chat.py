@@ -169,15 +169,35 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                             get_book_excerpts, serial, inner_q if len(inner_q) >= 2 else "", 8
                         )
 
-            # RAG 并行检索（识别到书目时跳过通用检索；assessment 多轮评估不需要检索）
+            # RAG 双通道并行检索（向量语义 + ILIKE 关键词，按 title 去重合并；
+            # 识别到书目时跳过通用检索；assessment 多轮评估不需要检索）
             rag_task = None
             if req.use_rag and not book and req.mode != "assessment":
+                from app.services.vector_search import search as vector_search
+
                 async def _rag():
                     try:
-                        data = await asyncio.to_thread(search_wiki, req.message, limit=5 if req.mode != "reading" else 15)
-                        results = data.get("results", []) if isinstance(data, dict) else []
-                        if results:
-                            return "\n\n".join(f"【{r.get('title','参考')}】\n{r.get('snippet', r.get('content',''))[:400]}" for r in results[:5])
+                        limit = 5 if req.mode != "reading" else 15
+                        # 通道①：向量语义检索（先跑，语义相关但无关键词命中的内容）
+                        vec_data = await asyncio.to_thread(vector_search, req.message, limit=limit)
+                        used = set()
+                        blocks = []
+                        for r in (vec_data.get("results", []) if isinstance(vec_data, dict) else []):
+                            t = r.get("title", "")
+                            if t in used:
+                                continue
+                            used.add(t)
+                            blocks.append(f"【{t}】\n{r.get('snippet', r.get('content', ''))[:400]}")
+                        # 通道②：ILIKE 关键词检索（补充精确关键词命中）
+                        like_data = await asyncio.to_thread(search_wiki, req.message, limit=limit)
+                        for r in (like_data.get("results", []) if isinstance(like_data, dict) else []):
+                            t = r.get("title", "")
+                            if t in used:
+                                continue
+                            used.add(t)
+                            blocks.append(f"【{t}】\n{r.get('snippet', r.get('content', ''))[:400]}")
+                        if blocks:
+                            return "\n\n".join(blocks[:8])
                     except Exception:
                         return ""
                     return ""
