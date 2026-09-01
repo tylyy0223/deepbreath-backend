@@ -121,7 +121,9 @@ app.include_router(email_router.router, tags=["邮件"])
 app.include_router(credits_router.router, tags=["Credits"])
 app.include_router(scales_router.router, tags=["心理量表"])
 app.include_router(references_router.router, tags=["参考文献"])
+from app.api.v1 import book_listen as book_listen_router
 from app.api.v1 import reading_progress as reading_router
+app.include_router(book_listen_router.router, tags=["AI听书"])
 app.include_router(reading_router.router, tags=["读书进度"])
 app.include_router(upload_router.router, tags=["文件上传"])
 app.include_router(audio_router.router, tags=["语音识别"])
