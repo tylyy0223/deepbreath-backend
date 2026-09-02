@@ -1,9 +1,6 @@
-"""AI 听书讲解 - 章节列表 / 详情 / 进度 / 限流（v3 严格限流版）"""
+"""AI 听书讲解 - 章节列表 / 详情 / 进度 / 限流"""
 import os
 import re
-import time
-import hashlib
-import base64
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -24,10 +21,23 @@ DB_KW = dict(
     password=os.environ.get("DEEPBREATH_DB_PASSWORD") or os.environ.get("DB_PASSWORD", ""),
 )
 DEFAULT_LIMIT_MIN = 120  # 默认 120min/天, 实际从 app_settings 读
+AUDIO_LINK_SECRET = "deepbreath_audio_2026"  # 必须与 47.103.62.70 / 47.103.58.89 nginx /audio/ location 的 secure_link_md5 一致
+AUDIO_LINK_TTL = 7200  # 2 小时有效
 
-# ---- 音频签名 (nginx secure_link) ----
-AUDIO_SECRET = "deepbreath_audio_2026"
-AUDIO_TTL = 3600  # 签名 1 小时有效
+
+def make_secure_audio_url(audio_url: str, ttl: int = AUDIO_LINK_TTL) -> str:
+    """生成 nginx secure_link 签名的 URL
+    audio_url: '/audio/004-271/ch01.mp3'
+    返回: '/audio/004-271/ch01.mp3?e=<expire>&st=<md5>'
+    """
+    if not audio_url or not audio_url.startswith("/audio/"):
+        return audio_url
+    import hashlib
+    import time
+    expires = int(time.time()) + ttl
+    # nginx secure_link_md5: "$secure_link_expires$uri <secret>" (中间有空格)
+    sig = hashlib.md5(f"{expires}{audio_url} {AUDIO_LINK_SECRET}".encode()).hexdigest()
+    return f"{audio_url}?e={expires}&st={sig}"
 
 
 def _connect():
@@ -51,7 +61,7 @@ def _get_setting(key: str, default: str) -> str:
 
 
 def _limit_dict() -> dict:
-    """读 app_settings 限流配置"""
+    """读 app_settings 限流配置 + 用户今日已用秒数 (供其它端点复用)"""
     limit_min = int(_get_setting("book_listen_daily_limit_minutes", str(DEFAULT_LIMIT_MIN)))
     enabled = _get_setting("book_listen_daily_limit_enabled", "true") == "true"
     return {
@@ -79,86 +89,25 @@ def _get_today_used(user_id: int) -> int:
         return 0
 
 
-def _try_add_listen_seconds(user_id: int, added_sec: int, limit_sec: int):
-    """原子检查+累加今日时长（FOR UPDATE 行锁）。返回 (是否成功, 新总量)。"""
-    conn = None
-    cur = None
+def _add_listen_seconds(user_id: int, added_sec: int):
+    """累加今日 listen_daily.total_seconds"""
+    if added_sec <= 0:
+        return
     try:
         conn = _connect()
         cur = conn.cursor()
         cur.execute(
-            "SELECT total_seconds FROM book_listen_daily "
-            "WHERE user_id=%s AND listen_date=CURRENT_DATE FOR UPDATE",
-            (user_id,),
+            "INSERT INTO book_listen_daily (user_id, listen_date, total_seconds) "
+            "VALUES (%s, CURRENT_DATE, %s) "
+            "ON CONFLICT (user_id, listen_date) "
+            "DO UPDATE SET total_seconds = book_listen_daily.total_seconds + EXCLUDED.total_seconds",
+            (user_id, added_sec),
         )
-        row = cur.fetchone()
-        used = int(row[0]) if row else 0
-        new_used = used + added_sec
-        if new_used > limit_sec:
-            conn.rollback()
-            return False, used
-        if row:
-            cur.execute(
-                "UPDATE book_listen_daily SET total_seconds=%s "
-                "WHERE user_id=%s AND listen_date=CURRENT_DATE",
-                (new_used, user_id),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO book_listen_daily (user_id, listen_date, total_seconds) "
-                "VALUES (%s, CURRENT_DATE, %s)",
-                (user_id, added_sec),
-            )
         conn.commit()
-        return True, new_used
+        cur.close()
+        conn.close()
     except Exception:
-        try:
-            if conn:
-                conn.rollback()
-        except Exception:
-            pass
-        return False, _get_today_used(user_id)
-    finally:
-        try:
-            if cur:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
-def _sign_audio(url: str) -> str:
-    """生成 nginx secure_link 签名 URL（st/e 参数，AUDIO_TTL 秒有效）"""
-    if not url or not url.startswith("/"):
-        return url
-    e = int(time.time()) + AUDIO_TTL
-    raw = f"{e}{url} {AUDIO_SECRET}"
-    md5 = hashlib.md5(raw.encode("utf-8")).digest()
-    st = base64.urlsafe_b64encode(md5).rstrip(b"=").decode()
-    return f"{url}?st={st}&e={e}"
-
-
-def _limit_state(user_id: int) -> dict:
-    """当前限流状态"""
-    ld = _limit_dict()
-    used_sec = _get_today_used(user_id)
-    limit_sec = ld["limit_minutes"] * 60
-    remain_sec = max(0, limit_sec - used_sec) if ld["enabled"] else limit_sec
-    return {**ld, "used_seconds": used_sec, "remaining_seconds": remain_sec}
-
-
-def _audio_for(user_id: int, url: str, duration: int):
-    """播放前检查：剩余额度足够才给签名音频，否则返回 None（前端无有效音频可播）"""
-    if not url:
-        return None, _limit_state(user_id)
-    st = _limit_state(user_id)
-    if st["enabled"] and st["remaining_seconds"] < duration:
-        return None, st
-    return _sign_audio(url), st
+        pass
 
 
 @router.get("/books")
@@ -170,6 +119,7 @@ async def list_books(
     try:
         conn = _connect()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # 1) 每本书汇总
         cur.execute(
             "SELECT serial, COUNT(*) AS chapters, "
             "       COALESCE(SUM(audio_duration), 0) AS total_seconds, "
@@ -181,6 +131,7 @@ async def list_books(
             "ORDER BY serial"
         )
         rows = cur.fetchall()
+        # 2) 用户对每本书的进度 (从 BookProgress 读, book_title = "<serial>: <title>")
         cur.execute(
             "SELECT book_title, current_chapter, total_chapters, updated_at "
             "FROM book_progress WHERE user_id=%s",
@@ -193,14 +144,16 @@ async def list_books(
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
     books = []
-    for r in rows:
+    for i, r in enumerate(rows, 1):
         serial = r["serial"]
+        # 尝试匹配进度: 找该 serial 下的任意 chapter 进度
         matched = None
         for bt, p in prog.items():
             if bt.startswith(f"{serial}:"):
                 matched = p
                 break
         last_chapter = matched["current_chapter"] if matched else 0
+        # 计算已听总秒 (估: (last_chapter-1) 章全听完 + 当前章 0)
         listened_sec_est = 0
         if last_chapter > 0:
             try:
@@ -220,6 +173,7 @@ async def list_books(
         progress = round((listened_sec_est / total_sec) * 100) if total_sec > 0 else 0
         books.append({
             "serial": serial,
+            "book_index": i,  # 经典书目中按 serial 升序的 1-based 编号
             "chapters": int(r["chapters"]),
             "total_seconds": total_sec,
             "total_chars": int(r["total_chars"]),
@@ -229,8 +183,17 @@ async def list_books(
             "progress_percent": progress,
         })
 
-    st = _limit_state(user_id)
-    return {"code": 0, "data": {"books": books, "limit": st}}
+    used_sec = _get_today_used(user_id)
+    ld = _limit_dict()
+    limit_sec = ld["limit_minutes"] * 60
+    remain_sec = max(0, limit_sec - used_sec) if ld["enabled"] else limit_sec
+    return {
+        "code": 0,
+        "data": {
+            "books": books,
+            "limit": {**ld, "used_seconds": used_sec, "remaining_seconds": remain_sec},
+        },
+    }
 
 
 @router.get("/serial/{serial}")
@@ -238,8 +201,7 @@ async def list_chapters(
     serial: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """列某本书的所有章节（音频 URL 已签名；剩余额度不足的章节 audio_url 为 null）"""
-    user_id = int(current_user["user_id"])
+    """列某本书的所有章节（含 LMS 评析稿 + 音频元数据）"""
     try:
         conn = _connect()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -257,25 +219,20 @@ async def list_chapters(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    st = _limit_state(user_id)
-    chapters = []
-    for r in rows:
-        dur = int(r["audio_duration"] or 0)
-        if st["enabled"] and st["remaining_seconds"] < dur:
-            audio = None  # 额度不足，不给可播音频
-        else:
-            audio = _sign_audio(r["audio_url"])
-        chapters.append({
+    chapters = [
+        {
             "chapter_idx": r["chapter_idx"],
             "title": r["title"],
             "kind": r["kind"],
-            "audio_url": audio,
-            "audio_duration": dur,
+            "audio_url": make_secure_audio_url(r["audio_url"]) if r["audio_url"] else None,
+            "audio_duration": r["audio_duration"],
             "explanation_chars": r["explanation_chars"],
             "source_chars": r["source_chars"],
             "status": r["status"],
-        })
-    return {"code": 0, "data": {"serial": serial, "chapters": chapters, "limit": st}}
+        }
+        for r in rows
+    ]
+    return {"code": 0, "data": {"serial": serial, "chapters": chapters}}
 
 
 @router.get("/serial/{serial}/{idx}")
@@ -284,8 +241,7 @@ async def get_chapter(
     idx: int,
     current_user: dict = Depends(get_current_user),
 ):
-    """拿某章详情（含 explanation 评析稿全文；播放前检查剩余额度并签名音频）"""
-    user_id = int(current_user["user_id"])
+    """拿某章详情（含 explanation 评析稿全文, 用于前端同步高亮）"""
     try:
         conn = _connect()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -305,8 +261,6 @@ async def get_chapter(
     if not r:
         raise HTTPException(status_code=404, detail="chapter not found")
 
-    dur = int(r["audio_duration"] or 0)
-    audio, st = _audio_for(user_id, r["audio_url"], dur)
     return {
         "code": 0,
         "data": {
@@ -316,10 +270,9 @@ async def get_chapter(
             "explanation": r["explanation"] or "",
             "explanation_chars": r["explanation_chars"],
             "source_chars": r["source_chars"],
-            "audio_url": audio,
-            "audio_duration": dur,
+            "audio_url": make_secure_audio_url(r["audio_url"]) if r["audio_url"] else None,
+            "audio_duration": r["audio_duration"],
             "status": r["status"],
-            "limit": st,
         },
     }
 
@@ -329,13 +282,20 @@ async def get_limit(
     current_user: dict = Depends(get_current_user),
 ):
     """查今日剩余可听分钟数 (跨书共用 120min)"""
-    return {"code": 0, "data": _limit_state(int(current_user["user_id"]))}
+    ld = _limit_dict()
+    used_sec = _get_today_used(int(current_user["user_id"]))
+    limit_sec = ld["limit_minutes"] * 60
+    remain_sec = max(0, limit_sec - used_sec) if ld["enabled"] else limit_sec
+    return {
+        "code": 0,
+        "data": {**ld, "used_seconds": used_sec, "remaining_seconds": remain_sec},
+    }
 
 
 class ProgressItem(BaseModel):
     chapter_idx: int
     position_sec: int = 0   # 客户端已播放秒数
-    listened_sec: int = 0   # 本次上报增量秒数 (用于限流累加)
+    listened_sec: int = 0   # 本次会话累计秒数 (用于限流累加)
 
 
 @router.post("/serial/{serial}/{idx}/progress")
@@ -345,36 +305,33 @@ async def save_progress(
     item: ProgressItem,
     current_user: dict = Depends(get_current_user),
 ):
-    """记听书进度 + 累加 listen_daily (限流)。原子累加 + 单次上报上限校验。"""
+    """记听书进度 + 累加 listen_daily (限流)"""
     user_id = int(current_user["user_id"])
+
+    # 限流校验
     enabled = _get_setting("book_listen_daily_limit_enabled", "true") == "true"
-    limit_min = int(_get_setting("book_listen_daily_limit_minutes", str(DEFAULT_LIMIT_MIN)))
-    limit_sec = limit_min * 60
+    if enabled and item.listened_sec > 0:
+        limit_min = int(_get_setting("book_listen_daily_limit_minutes", str(DEFAULT_LIMIT_MIN)))
+        used_sec = _get_today_used(user_id)
+        if used_sec + item.listened_sec > limit_min * 60:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "daily_limit_exceeded",
+                    "limit_minutes": limit_min,
+                    "used_seconds": used_sec,
+                    "tried_to_add": item.listened_sec,
+                },
+            )
+        # 累加今日
+        _add_listen_seconds(user_id, item.listened_sec)
 
-    # 本章时长（用于单次上报上限校验，防伪造/重试重复累加）
-    duration = 0
-    try:
-        conn = _connect()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT audio_duration FROM book_chapters WHERE serial=%s AND chapter_idx=%s",
-            (serial, idx),
-        )
-        row = cur.fetchone()
-        duration = int(row[0] or 0) if row else 0
-        cur.close()
-        conn.close()
-    except Exception:
-        pass
-    max_once = max(duration * 1.5, 60)  # 单次上报不得超过 1.5 倍章长（至少 60s 容差）
-    if item.listened_sec > max_once:
-        item.listened_sec = 0  # 异常值不参与限流累加（进度仍保存）
-
-    # 写 reading_progress（先写进度，成功后才累加限流）
+    # 写 reading_progress (复用 BookProgress, 用 book_title = "<serial>: <title>" 表示 chapter)
     try:
         async with async_session() as session:
             from app.models.cache import BookProgress
             from sqlalchemy import select
+            # 查书名
             conn = _connect()
             cur = conn.cursor()
             cur.execute(
@@ -411,19 +368,5 @@ async def save_progress(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"save error: {e}")
-
-    # 进度保存成功后才原子累加限流
-    if enabled and item.listened_sec > 0:
-        ok, new_used = _try_add_listen_seconds(user_id, item.listened_sec, limit_sec)
-        if not ok:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "daily_limit_exceeded",
-                    "limit_minutes": limit_min,
-                    "used_seconds": new_used,
-                    "tried_to_add": item.listened_sec,
-                },
-            )
 
     return {"code": 0, "message": "ok", "data": {"position_sec": item.position_sec}}

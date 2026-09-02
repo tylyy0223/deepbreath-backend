@@ -20,6 +20,7 @@ WIKI_DB = {
     "dbname": os.environ.get("WIKI_DB_NAME", "wikijs"),
     "user": os.environ.get("WIKI_DB_USER", "deepbreath_wiki_reader"),
     "password": os.environ.get("WIKI_DB_PASSWORD", ""),
+    "client_encoding": "UTF8",
 }
 
 _SEG_PREFIX = re.compile(r"^004-\d{3}[-\s]*")

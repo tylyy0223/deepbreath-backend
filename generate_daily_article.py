@@ -118,6 +118,7 @@ def save_article(art: dict):
     slug_base = art["area"].replace(" ", "-")[:30]
     slug = f"daily-{slug_base}-{datetime.now(CST).strftime('%Y%m%d')}"
     conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
+    conn.set_client_encoding("UTF8")  # SQL_ASCII 库必须显式 UTF8，否则中文写入报 ascii 错
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         # 查分类 ID

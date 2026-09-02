@@ -17,7 +17,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_TTS_URL = "https://api.minimaxi.com/v1/t2a_v2"
-VOICE_ID = "female-shaonv"
+VOICE_ID = "male-qn-qingse"
 
 
 class TTSRequest(BaseModel):
@@ -50,7 +50,7 @@ async def synthesize(
                     MINIMAX_TTS_URL,
                     headers={"Authorization": f"Bearer {MINIMAX_API_KEY}", "Content-Type": "application/json"},
                     json={
-                        "model": "speech-01-turbo", "text": text, "stream": False,
+                        "model": "speech-2.8-hd", "text": text, "stream": False,
                         "voice_setting": {"voice_id": VOICE_ID, "speed": 1.0, "vol": 1.0, "pitch": 0},
                         "audio_setting": {"sample_rate": 32000, "bitrate": 128000, "format": "mp3"},
                     },
