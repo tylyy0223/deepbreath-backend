@@ -22,6 +22,22 @@ DB_KW = dict(
 )
 DEFAULT_LIMIT_MIN = 120  # 默认 120min/天, 实际从 app_settings 读
 AUDIO_LINK_SECRET = "deepbreath_audio_2026"  # 必须与 47.103.62.70 / 47.103.58.89 nginx /audio/ location 的 secure_link_md5 一致
+
+# serial -> 书名（wiki 004 树，听书列表书名显示用）
+BOOK_TITLES = {
+    "004-002": "遇见未知的自己",
+    "004-003": "走出孤独",
+    "004-004": "超级心智",
+    "004-005": "女性心灵成长图鉴",
+    "004-006": "荣格分析心理学导论",
+    "004-007": "衰老的真相",
+    "004-028": "爱情心理学",
+    "004-175": "20个心理学典型现象",
+    "004-176": "7个顶级心理预言",
+    "004-211": "少有人走的路（心智成熟的旅程）",
+    "004-213": "自控力",
+    "004-271": "蛤蟆先生去看心理医生",
+}
 AUDIO_LINK_TTL = 7200  # 2 小时有效
 
 
@@ -177,7 +193,7 @@ async def list_books(
             "chapters": int(r["chapters"]),
             "total_seconds": total_sec,
             "total_chars": int(r["total_chars"]),
-            "first_title": r["first_title"],
+            "first_title": BOOK_TITLES.get(serial, r["first_title"]),  # 优先显示真实书名
             "last_chapter": last_chapter,
             "listened_seconds_est": listened_sec_est,
             "progress_percent": progress,
