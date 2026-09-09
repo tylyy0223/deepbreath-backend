@@ -17,6 +17,7 @@ from app.models.cache import LoginLog
 from app.schemas.auth import (
     RegisterRequest, LoginRequest, RefreshRequest,
     TokenResponse, UserInfo, UserProfileUpdate, ApiResponse,
+    ResetPasswordRequest,
 )
 from app.services.sms_service import (
     valid_phone, mask_phone, send_code, verify_code,
@@ -74,28 +75,30 @@ async def _log_login(user_id: int | None, email: str, action: str, success: bool
 @router.post("/register", response_model=TokenResponse)
 async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """用户注册（手机号唯一 + 短信验证）"""
-    existing = await db.execute(select(User).where(User.email == req.email))
-    if existing.scalar_one_or_none():
-        await _log_login(None, req.email, "register", False, request, "邮箱已注册")
-        raise HTTPException(status_code=400, detail="该邮箱已注册")
+    # 邮箱选填：非空才做查重
+    if req.email:
+        existing = await db.execute(select(User).where(User.email == req.email))
+        if existing.scalar_one_or_none():
+            await _log_login(None, req.email, "register", False, request, "邮箱已注册")
+            raise HTTPException(status_code=400, detail="该邮箱已注册")
 
-    # 手机号唯一性 / 封禁校验（仅当提供了手机号时）
-    if req.phone:
-        await _check_phone_available(req.phone, db)
-        if not await verify_code(req.phone, req.sms_code):
-            await _log_login(None, req.email, "register", False, request, "验证码错误")
-            raise HTTPException(status_code=400, detail="验证码错误或已过期")
+    # 手机号必填 + 唯一性 / 封禁 / 验证码校验
+    if not valid_phone(req.phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确")
+    await _check_phone_available(req.phone, db)
+    if not await verify_code(req.phone, req.sms_code):
+        await _log_login(None, req.email, "register", False, request, "验证码错误")
+        raise HTTPException(status_code=400, detail="验证码错误或已过期")
 
     # 创建用户
     user = User(
         email=req.email,
         password_hash=hash_password(req.password),
-        nickname=req.nickname or req.email.split("@")[0],
+        nickname=req.nickname or (f"用户{req.phone[-4:]}" if req.email == "" else req.email.split("@")[0]),
         role=Roles.USER,
         status="active",
     )
-    if req.phone:
-        user.phone = req.phone
+    user.phone = req.phone  # 必填, 直接赋
     db.add(user)
     await db.flush()
 
@@ -131,23 +134,44 @@ def _verify_legacy_sha256(password: str, stored_hash: str) -> bool:
 
 @router.post("/login", response_model=TokenResponse)
 async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
-    """用户登录：邮箱+密码 或 手机号+短信验证码"""
+    """用户登录：手机号+密码（默认）| 手机号+验证码 | 邮箱+密码（次要）"""
     phone = (req.phone or "").strip()
     email = (req.email or "").strip().lower()
 
-    # ---- 手机号 + 验证码登录 ----
+    # ---- 手机号登录（密码默认；验证码为辅）----
     if phone:
         result = await db.execute(select(User).where(User.phone == phone))
         user = result.scalar_one_or_none()
         if not user:
             await _log_login(None, phone, "login", False, request, "手机号未注册")
             raise HTTPException(status_code=401, detail="该手机号未注册，请先注册")
-        if not await verify_code(phone, req.sms_code):
-            await _log_login(user.id, user.email, "login", False, request, "验证码错误")
-            raise HTTPException(status_code=401, detail="验证码错误或已过期")
+        if req.password:
+            # 手机号 + 密码（缺省方式）
+            password_ok = False
+            try:
+                if verify_password(req.password, user.password_hash):
+                    password_ok = True
+            except Exception:
+                pass
+            if not password_ok and _verify_legacy_sha256(req.password, user.password_hash):
+                user.password_hash = hash_password(req.password)
+                await db.flush()
+                password_ok = True
+            if not password_ok:
+                await _log_login(user.id, user.email, "login", False, request, "密码错误")
+                raise HTTPException(status_code=401, detail="密码错误")
+        elif req.sms_code:
+            # 手机号 + 验证码（辅助）
+            if not await verify_code(phone, req.sms_code):
+                await _log_login(user.id, user.email, "login", False, request, "验证码错误")
+                raise HTTPException(status_code=401, detail="验证码错误或已过期")
+        else:
+            raise HTTPException(status_code=400, detail="请输入密码或验证码")
         return await _finalize_login(user, request, db)
 
     # ---- 邮箱 + 密码登录 ----
+    if not email or not req.password:
+        raise HTTPException(status_code=400, detail="请输入手机号或邮箱")
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
 
@@ -313,9 +337,37 @@ async def change_password(
     return ApiResponse(message="密码已修改")
 
 
+@router.post("/password/reset")
+async def reset_password(
+    req: ResetPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """忘记密码：手机号 + 短信验证码 重置密码（免登录）"""
+    result = await db.execute(select(User).where(User.phone == req.phone))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="该手机号未注册")
+    if user.status == "banned":
+        raise HTTPException(status_code=403, detail="该账号已被禁用")
+    if not await verify_code(req.phone, req.sms_code):
+        await _log_login(user.id, user.email, "reset_password", False, request, "验证码错误")
+        raise HTTPException(status_code=400, detail="验证码错误或已过期")
+
+    user.password_hash = hash_password(req.new_password)
+    await db.flush()
+
+    # 撤销所有 refresh token：其他设备需重新登录
+    from app.core.redis import revoke_all_refresh_tokens
+    await revoke_all_refresh_tokens(user.id)
+
+    await _log_login(user.id, user.email, "reset_password", True, request)
+    return ApiResponse(message="密码已重置，请用新密码登录")
+
+
 class SmsSendRequest(BaseModel):
     phone: str
-    scene: str = "register"  # register | bind | login
+    scene: str = "register"  # register | bind | login | reset
 
 
 @router.post("/sms/send")
@@ -332,15 +384,16 @@ async def sms_send(
     if req.scene == "bind" and not current_user:
         raise HTTPException(status_code=401, detail="请先登录")
 
-    # login 场景：手机号必须已注册；register/bind：发码前做占用校验
-    if req.scene == "login":
+    # login/reset 场景：手机号必须已注册；register/bind：发码前做占用校验
+    if req.scene in ("login", "reset"):
         r = await db.execute(select(User).where(User.phone == phone))
         holder = r.scalar_one_or_none()
         if not holder:
-            raise HTTPException(status_code=404, detail="该手机号未注册，请先注册")
+            hint = "该手机号未注册，请先注册" if req.scene == "login" else "该手机号未注册"
+            raise HTTPException(status_code=404, detail=hint)
         if holder.status == "banned":
             raise HTTPException(status_code=403, detail="该账号已被禁用")
-        # 已注册用户发登录码：跳过占用校验（占用校验会因"已注册"误报 400）
+        # 已注册用户发码：跳过占用校验（占用校验会因"已注册"误报 400）
     else:
         await _check_phone_available(phone, db)
 

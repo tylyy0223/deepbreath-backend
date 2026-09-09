@@ -4,18 +4,19 @@ import re
 
 
 class RegisterRequest(BaseModel):
-    email: str
+    email: str = ""  # 选填（新用户以手机号为主；邮箱仅作为可选录入）
     password: str
     nickname: str = ""
-    phone: str = ""
-    sms_code: str = ""
+    phone: str  # 必填：用于防刷 + 唯一性
+    sms_code: str  # 必填：手机号验证码
 
     @field_validator("email")
     @classmethod
     def validate_email(cls, v):
-        if "@" not in v or len(v) > 255:
+        v = (v or "").strip().lower()
+        if v and ("@" not in v or len(v) > 255):
             raise ValueError("邮箱格式不正确")
-        return v.lower().strip()
+        return v
 
     @field_validator("password")
     @classmethod
@@ -39,7 +40,7 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    """登录请求：邮箱+密码 或 手机号+验证码 二选一"""
+    """登录请求：手机号+密码（默认）| 手机号+验证码 | 邮箱+密码 三选一"""
     email: str = ""
     password: str = ""
     phone: str = ""
@@ -59,6 +60,28 @@ class LoginRequest(BaseModel):
         v = (v or "").strip()
         if v and not re.match(r"^1[3-9]\d{9}$", v):
             raise ValueError("手机号格式不正确")
+        return v
+
+
+class ResetPasswordRequest(BaseModel):
+    """忘记密码：手机号 + 短信验证码 重置密码（免登录）"""
+    phone: str
+    sms_code: str
+    new_password: str
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        v = (v or "").strip()
+        if not re.match(r"^1[3-9]\d{9}$", v):
+            raise ValueError("手机号格式不正确")
+        return v
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password(cls, v):
+        if len(v) < 6:
+            raise ValueError("密码至少 6 位")
         return v
 
 
