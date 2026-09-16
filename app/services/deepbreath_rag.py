@@ -1,5 +1,6 @@
 """Wiki.js 知识库搜索（原依赖 psy-chat，已内迁到 DeepBreath services）"""
-import os, re, psycopg2, psycopg2.extras
+import os, re, threading, psycopg2, psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 
 WIKI_BASE_URL = "https://luoyuyu.cn"
 
@@ -23,19 +24,38 @@ def _load_env_fallback():
 
 _load_env_fallback()
 
+# ==== psycopg2 连接池 (线程安全) ====
+# 修复: 原代码每次 search_wiki 都 psycopg2.connect(), TCP 握手 + 认证 + 准备开销约 50-200ms,
+#       RAG 每次聊天都触发, 严重拖慢响应. 改为 ThreadedConnectionPool 复用连接.
+# 池大小 1-5: RAG 是低频只读查询, 不需要太多连接, 1 个保底 + 5 个上限避免耗尽 PG max_connections.
+_pool: ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:  # double-check
+                _pool = ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=5,
+                    host=os.environ.get("WIKI_DB_HOST", "127.0.0.1"),
+                    port=int(os.environ.get("WIKI_DB_PORT", "5432")),
+                    dbname=os.environ.get("WIKI_DB_NAME", "wikijs"),
+                    user=os.environ.get("WIKI_DB_USER", "deepbreath_wiki_reader"),
+                    password=os.environ.get("WIKI_DB_PASSWORD", ""),
+                    connect_timeout=3,
+                )
+    return _pool
+
 
 def search_wiki(query, limit=5):
     """在 v_psy_chat_pages 视图中搜索"""
     rows = []
+    conn = None
     try:
-        conn = psycopg2.connect(
-            host=os.environ.get("WIKI_DB_HOST", "127.0.0.1"),
-            port=int(os.environ.get("WIKI_DB_PORT", "5432")),
-            dbname=os.environ.get("WIKI_DB_NAME", "wikijs"),
-            user=os.environ.get("WIKI_DB_USER", "deepbreath_wiki_reader"),
-            password=os.environ.get("WIKI_DB_PASSWORD", ""),
-            connect_timeout=3,
-        )
+        conn = _get_pool().getconn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         sql = """
             SELECT id, title, description,
@@ -52,8 +72,14 @@ def search_wiki(query, limit=5):
         cur.execute(sql, (pattern, pattern, pattern, limit))
         rows = cur.fetchall()
         cur.close()
-        conn.close()
+        # 关键: 不用 close(), 用 putconn() 还回连接池 (连接复用)
+        _get_pool().putconn(conn)
     except Exception as e:
+        if conn is not None:
+            try:
+                _get_pool().putconn(conn)  # 出错也要还回池
+            except Exception:
+                pass
         return {"error": str(e), "results": [], "total": 0}
 
     results = []

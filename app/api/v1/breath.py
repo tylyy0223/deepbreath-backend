@@ -115,10 +115,15 @@ async def practice_stats(
     )
     week_sessions = r2.scalar() or 0
 
-    # 连续天数：取去重的练习日期（按北京时间切日），从今天（或昨天）往前数连续
+    # 连续天数: 1 次查最近 365 天内所有去重的练习日期 (streak 不可能超过 365),
+    # 然后从今天(或昨天)往前数连续; 加时间范围避免查全表 (用户长期用, 历史可能上万条)
     r3 = await db.execute(
         select(func.date(BreathSession.completed_at.op("AT TIME ZONE")("Asia/Shanghai")))
-        .where(BreathSession.user_id == user_id, BreathSession.completed == True)  # noqa: E712
+        .where(
+            BreathSession.user_id == user_id,
+            BreathSession.completed == True,  # noqa: E712
+            BreathSession.completed_at >= now_cn - timedelta(days=400),  # 多查些防边界
+        )
         .distinct()
     )
     days = {d for (d,) in r3.all() if d is not None}

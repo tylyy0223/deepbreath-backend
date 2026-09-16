@@ -175,22 +175,23 @@ async def diary_stats(
     )
     avg_mood, total = r.one()
 
-    # 2) 连续记录天数：从今天（北京时间）往回逐日检查，断档即停。
-    #    用 (created_at AT TIME ZONE 'Asia/Shanghai')::date 保证按北京时间切日，
-    #    不依赖连接时区。
+    # 2) 连续记录天数: 1 次查最近 ~365 天的 distinct 日期集合, Python 里数连续段
+    #    替代原 N+1 循环 (每天一次 COUNT 查询, 最坏 365 次)
+    max_streak_window = min(365, days + 1)
+    r_streak = await db.execute(
+        select(func.date(MoodEntry.created_at.op("AT TIME ZONE")("Asia/Shanghai")).label("d"))
+        .where(
+            MoodEntry.user_id == user_id,
+            MoodEntry.created_at >= today_cn - _td(days=max_streak_window),
+        )
+        .distinct()
+    )
+    date_set = {row[0] for row in r_streak.all() if row[0] is not None}
     streak = 0
-    for i in range(min(365, days + 1)):
-        d = today_cn - _td(days=i)
-        cnt = (await db.execute(
-            select(func.count(MoodEntry.id)).where(
-                MoodEntry.user_id == user_id,
-                func.date(MoodEntry.created_at.op("AT TIME ZONE")("Asia/Shanghai")) == d,
-            )
-        )).scalar() or 0
-        if cnt > 0:
-            streak += 1
-        else:
-            break
+    cursor = today_cn
+    while cursor in date_set:
+        streak += 1
+        cursor -= _td(days=1)
 
     # 3) 常见情绪：基于 mood_score 的标准情绪档位（1=很糟糕 … 5=很开心），
     #    取最高频档位的名称（自由文本 mood_label 不参与统计）。

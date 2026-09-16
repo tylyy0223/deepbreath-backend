@@ -103,12 +103,18 @@ async def get_post(
     )
     replies = replies_r.scalars().all()
 
+    # 批量查所有非匿名 reply 的作者 (1 次查询替代 N 次)
+    author_ids = {rp.author_id for rp in replies if not rp.is_anonymous and rp.author_id}
+    authors_map: dict[int, User] = {}
+    if author_ids:
+        ar2 = await db.execute(select(User).where(User.id.in_(author_ids)))
+        authors_map = {u.id: u for u in ar2.scalars().all()}
+
     reply_list = []
     for rp in replies:
         rp_author = None
         if not rp.is_anonymous and rp.author_id:
-            ar2 = await db.execute(select(User).where(User.id == rp.author_id))
-            au2 = ar2.scalar_one_or_none()
+            au2 = authors_map.get(rp.author_id)
             if au2:
                 rp_author = {"nickname": au2.nickname, "avatar_url": au2.avatar_url}
         reply_list.append({

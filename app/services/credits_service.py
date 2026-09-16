@@ -78,12 +78,13 @@ async def charge(db: AsyncSession, user_id: int, cost: int, ref: str = "", note:
     """
     if cost <= 0:
         return True
-    # PG advisory lock 基于 user_id 哈希 (避免占满单数字空间), 事务级自动释放
+    # PG advisory lock 基于 user_id (事务级串行化, 防 check-then-act 竞态)
     await db.execute(
         text("SELECT pg_advisory_xact_lock(:uid)"),
         {"uid": user_id},
     )
-    balance = await get_balance(db, user_id)
+    # 锁内必须实时算 (use_cache=False), 缓存可能 stale; 末尾 invalidate 保证后续读最新
+    balance = await get_balance(db, user_id, use_cache=False)
     if balance < cost:
         return False
     db.add(CreditTransaction(
@@ -91,4 +92,5 @@ async def charge(db: AsyncSession, user_id: int, cost: int, ref: str = "", note:
         balance_after=balance - cost,
     ))
     await db.flush()
+    await _invalidate_balance_cache(user_id)
     return True
