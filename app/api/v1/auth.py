@@ -1,6 +1,6 @@
 """认证 API — 注册 / 登录 / Token 刷新 / 个人信息 + 登录日志"""
 import hashlib
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
 from app.core.database import get_db, async_session
@@ -84,6 +84,40 @@ async def _record_login_failure(identifier: str, ip: str):
     except Exception:
         pass
 
+# ==== refresh_token cookie 配置 (httpOnly 防御 XSS 窃取 refresh) ====
+import os as _os_cookie
+
+REFRESH_COOKIE_NAME = "deepbreath_refresh"
+REFRESH_COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 天, 与 refresh token 有效期一致
+# 生产环境 (HTTPS): Secure=True, cookie 仅 HTTPS 发
+# 开发环境 (HTTP): Secure=False, 否则浏览器拒绝发送
+COOKIE_SECURE = _os_cookie.environ.get("COOKIE_SECURE", "false").lower() == "true"
+
+
+def _set_refresh_cookie(response, refresh_token: str) -> None:
+    """设置 refresh_token cookie (HttpOnly + SameSite=Lax)"""
+    response.set_cookie(
+        key=REFRESH_COOKIE_NAME,
+        value=refresh_token,
+        max_age=REFRESH_COOKIE_MAX_AGE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_refresh_cookie(response) -> None:
+    """清除 refresh_token cookie (登出 / 改密时调用)"""
+    response.delete_cookie(
+        key=REFRESH_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+    )
+
+
 async def _clear_login_failures(identifier: str, ip: str):
     """登录成功后清除账号 + IP 的失败计数"""
     try:
@@ -109,7 +143,7 @@ async def _log_login(user_id: int | None, email: str, action: str, success: bool
 
 
 @router.post("/register", response_model=TokenResponse)
-async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def register(req: RegisterRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     """用户注册（手机号唯一 + 短信验证）"""
     ip = _get_ip(request)
 
@@ -201,7 +235,7 @@ def _verify_legacy_sha256(password: str, stored_hash: str) -> bool:
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def login(req: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     """用户登录：手机号+密码（默认）| 手机号+验证码 | 邮箱+密码（次要）"""
     phone = (req.phone or "").strip()
     email = (req.email or "").strip().lower()
@@ -250,7 +284,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
         else:
             raise HTTPException(status_code=400, detail="请输入密码或验证码")
         await _clear_login_failures(identifier, ip)
-        return await _finalize_login(user, request, db)
+        return await _finalize_login(user, request, response, db)
 
     # ---- 邮箱 + 密码登录 ----
     if not email or not req.password:
@@ -281,10 +315,10 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
 
     await _clear_login_failures(identifier, ip)
-    return await _finalize_login(user, request, db)
+    return await _finalize_login(user, request, response, db)
 
 
-async def _finalize_login(user: User, request: Request, db: AsyncSession):
+async def _finalize_login(user: User, request: Request, response, db: AsyncSession):
     """登录成功公共逻辑：封禁校验 + 签发 Token + 登录日志"""
     if user.status == "banned":
         await _log_login(user.id, user.email, "login", False, request, "账号已封禁")
@@ -297,6 +331,8 @@ async def _finalize_login(user: User, request: Request, db: AsyncSession):
     access_token = create_access_token(user.id, user.role)
     refresh_token = create_refresh_token(user.id)
     await store_refresh_token(user.id, refresh_token)
+    # === refresh_token 走 cookie (httpOnly, JS 读不到), 同时 body 保留兼容旧前端 ===
+    _set_refresh_cookie(response, refresh_token)
     await _log_login(user.id, user.email, "login", True, request)
 
     return TokenResponse(
@@ -307,16 +343,34 @@ async def _finalize_login(user: User, request: Request, db: AsyncSession):
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
-    """刷新 Access Token"""
-    payload = decode_token(req.refresh_token)
+async def refresh(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """刷新 Access Token
+
+    优先从 cookie (httpOnly, JS 读不到) 读 refresh_token.
+    fallback 到 body 兼容旧前端 (切换期).
+    """
+    refresh_token = request.cookies.get(REFRESH_COOKIE_NAME)
+    if not refresh_token:
+        try:
+            body = await request.json()
+            refresh_token = body.get("refresh_token")
+        except Exception:
+            pass
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="缺少 refresh token (cookie 或 body)")
+
+    payload = decode_token(refresh_token)
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Refresh Token 无效或已过期")
 
     user_id = int(payload["sub"])
 
     # 验证 refresh token 是否还存在于 Redis
-    if not await validate_refresh_token(user_id, req.refresh_token):
+    if not await validate_refresh_token(user_id, refresh_token):
         raise HTTPException(status_code=401, detail="Refresh Token 已被撤销")
 
     # 查询用户
@@ -325,11 +379,12 @@ async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
     if not user or user.status != "active":
         raise HTTPException(status_code=401, detail="用户不存在或已被禁用")
 
-    # 轮换 refresh token
-    await revoke_refresh_token(user_id, req.refresh_token)
+    # 轮换 refresh token (撤旧发新, cookie 也更新)
+    await revoke_refresh_token(user_id, refresh_token)
     new_access = create_access_token(user.id, user.role)
     new_refresh = create_refresh_token(user.id)
     await store_refresh_token(user.id, new_refresh)
+    _set_refresh_cookie(response, new_refresh)
 
     return TokenResponse(
         access_token=new_access,
