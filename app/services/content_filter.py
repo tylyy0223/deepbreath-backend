@@ -16,10 +16,21 @@ BLOCK_WORDS = [
     # 广告/营销
     "加微信", "加我微信", "微信号", "扫码加", "免费咨询",
     "收费", "价格", "付款", "转账", "代购",
-    # 政治敏感
+    "兼职", "日结", "高薪", "招聘",
+    # 暴力 / 自伤
     "自杀方法", "如何自杀", "怎么死", "自残方法",
+    "轻生", "自尽", "了断", "寻死",
     # 色情
-    "约炮", "一夜情",
+    "约炮", "一夜情", "裸聊", "约pao",
+    # 政治敏感 (基础兜底, 主要靠第三方服务)
+    "法轮", "反动",
+    # 谐音/拼音首字母常见绕过 (大写/小写都匹配)
+    "zs", "js", "jb", "np", "yp", "qx",
+    "毒贩", "毒品", "白粉",
+    # 营销引流
+    "加我", "私聊", "私信",
+    # 伪造身份
+    "医生加", "医院", "开方",
 ]
 
 # 需要替换为安全词汇的
@@ -81,17 +92,31 @@ def check_content(text: str) -> tuple[bool, str]:
             if word in src_text:
                 return False, "内容包含不当词汇，请修改后重新发布"
 
-    # 2. 替换敏感词 (在归一化文本上做替换)
+    # 2. 替换敏感词 (在归一化文本上做替换, 一次循环)
     filtered = normalized
     for old, new in REPLACE_MAP.items():
         filtered = filtered.replace(old, new)
 
-    # 2. 替换敏感词
-    filtered = text
-    for old, new in REPLACE_MAP.items():
-        filtered = filtered.replace(old, new)
+    # 3. 检查拼音声母首字母绕过 (如 "zs" → "自杀", "np" → "强奸")
+    #    攻击者常把敏感词转成拼音首字母规避检测, 用最小同音映射防
+    _pinyin_initials_block = {
+        # 拼音首字母 -> 真实敏感词 (大小写不敏感)
+        "zs": "自杀",
+        "js": "奸杀",
+        "np": "强奸",
+        "yp": "淫片",
+        "qx": "强奸",
+        "jb": "几吧",  # 粗口
+        "sm": "色情",
+        "bc": "婊子",
+    }
+    normalized_lower = filtered.lower()
+    for initials, word in _pinyin_initials_block.items():
+        # 单独出现 (前后空格/标点) 才算, 避免误伤英文单词
+        if re.search(rf"(^|[^a-z]){re.escape(initials)}([^a-z]|$)", normalized_lower):
+            return False, "内容包含不当词汇，请修改后重新发布"
 
-    # 3. 检查联系电话（11 位手机号、座机号）
+    # 5. 检查联系电话（11 位手机号、座机号）
     if re.search(r"1[3-9]\d{9}", filtered):
         return False, "请勿发布手机号码"
 

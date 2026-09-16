@@ -1,7 +1,7 @@
 """社区 API — 匿名树洞 + 互助广场"""
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, insert, delete
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 from app.core.database import get_db
@@ -248,17 +248,43 @@ async def like_post(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """点赞/取消点赞"""
-    r = await db.execute(select(CommunityLike).where(CommunityLike.post_id == post_id, CommunityLike.user_id == current_user["user_id"]))
-    existing = r.scalar_one_or_none()
-    if existing:
-        await db.delete(existing)
-        await db.execute(update(CommunityPost).where(CommunityPost.id == post_id).values(like_count=CommunityPost.like_count - 1))
-        action = "unliked"
-    else:
-        db.add(CommunityLike(post_id=post_id, user_id=current_user["user_id"]))
-        await db.execute(update(CommunityPost).where(CommunityPost.id == post_id).values(like_count=CommunityPost.like_count + 1))
+    """点赞/取消点赞 (并发安全)
+
+    修复原 read-then-write 竞态:
+      原代码两个并发请求都判断 existing=None, 都 add + like_count+1,
+      唯一约束阻止重复行但 like_count 已被 +2, 实际只 +1 -> 计数漂移.
+
+    新逻辑: INSERT ... ON CONFLICT DO NOTHING (依赖 community_likes 唯一约束),
+            affected_rows 决定 like_count +/- 1.
+    """
+    user_id = current_user["user_id"]
+    # 1. 尝试 INSERT (依赖唯一约束, 重复返回 0 rows)
+    insert_result = await db.execute(
+        insert(CommunityLike).values(post_id=post_id, user_id=user_id)
+        .on_conflict_do_nothing(index_elements=["post_id", "user_id"])
+        .returning(CommunityLike.id)
+    )
+    inserted = insert_result.scalar_one_or_none() is not None
+
+    if inserted:
+        # 新增点赞: like_count + 1
+        await db.execute(update(CommunityPost).where(CommunityPost.id == post_id)
+            .values(like_count=CommunityPost.like_count + 1))
         action = "liked"
+    else:
+        # 已存在 -> 删除 (取消点赞)
+        del_result = await db.execute(
+            delete(CommunityLike).where(
+                CommunityLike.post_id == post_id,
+                CommunityLike.user_id == user_id,
+            ).returning(CommunityLike.id)
+        )
+        if del_result.scalar_one_or_none() is not None:
+            await db.execute(update(CommunityPost).where(CommunityPost.id == post_id)
+                .values(like_count=CommunityPost.like_count - 1))
+            action = "unliked"
+        else:
+            action = "noop"  # 极端并发, 已被别人删, 不动计数
     await db.flush()
     return {"code": 0, "data": {"action": action}}
 
