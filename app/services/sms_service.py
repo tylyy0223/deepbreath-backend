@@ -36,6 +36,12 @@ TENCENT_SMS_URL = "https://yun.tim.qq.com/v5/tlssmssvr/sendsms"
 # 签名与模板审核通过并配置后自动启用真实发送
 SMS_ENABLED = bool(TENCENT_SDKAPPID and TENCENT_APPKEY and TENCENT_SIGN and TENCENT_TPL_ID)
 
+if not SMS_ENABLED:
+    logger.warning(
+        "[SMS-MOCK] 短信服务未完全配置，所有验证码将被放行！"
+        " 生产环境务必配齐 TENCENT_SMS_SDKAPPID/APPKEY/SIGN/TPL_ID"
+    )
+
 PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
 
 CODE_TTL = 300        # 验证码有效期 5 分钟
@@ -74,6 +80,7 @@ async def send_code(phone: str, ip: str = "") -> None:
 async def verify_code(phone: str, code: str) -> bool:
     """校验验证码（一次性）。MOCK 模式放行"""
     if not SMS_ENABLED:
+        logger.warning("[SMS-MOCK] verify_code bypass: phone=%s code=%s", phone, code)
         return True
     stored = await redis_client.get(f"sms:code:{phone}")
     if stored and code and stored == code.strip():

@@ -188,6 +188,6 @@ ul{{list-style:none}}li{{padding:6px 0;font-size:13px}}a{{color:#7c8a7a;text-dec
 
 
 @app.get("/api/health")
-async def health_check():
-    """健康检查端点"""
+async def health_check_simple():
+    """健康检查端点（轻量）"""
     return {"status": "ok", "version": settings.APP_VERSION, "name": settings.APP_NAME}

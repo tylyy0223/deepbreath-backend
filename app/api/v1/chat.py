@@ -127,6 +127,8 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
 
     async def event_stream():
         nonlocal full_response
+        # StreamingResponse 生命周期长于路由依赖注入, 必须自建 session
+        # finally 块保证 rollback + close, 不会泄漏连接
         db = async_session()
         session_id = req.session_id
         # 标记用户正在 AI 对话中（流结束清除）——管理后台"当前 AI 并发"数据源
@@ -205,7 +207,7 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
 
             # QACache 永久缓存检查（排除 assessment：多轮评估的短句回答高度依赖上下文，
             # 命中其他会话的旧答案会导致答非所问的"卡壳"）
-            qa_hash = hashlib.md5(req.message.encode()).hexdigest()
+            qa_hash = hashlib.sha256(req.message.encode()).hexdigest()
             qa = None
             if req.mode != "assessment":
                 qa_cached = await db.execute(

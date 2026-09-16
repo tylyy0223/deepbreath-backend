@@ -103,7 +103,8 @@ async def list_references():
     try:
         conn = psycopg2.connect(**WIKI_DB, connect_timeout=3)
     except Exception as e:
-        return {"code": 1, "message": f"知识库暂不可用: {e}", "data": {"books": [], "total": 0}}
+        import logging; logging.getLogger(__name__).warning("Wiki DB connect failed: %s", e)
+        return {"code": 1, "message": "知识库暂不可用，请稍后重试", "data": {"books": [], "total": 0}}
 
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
