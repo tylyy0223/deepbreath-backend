@@ -347,8 +347,19 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
 
             yield json.dumps({"done": True, "session_id": session_id, "cost": cost, "sources": []}, ensure_ascii=False) + "\n"
         except Exception as e:
+            # 安全: 不把内部 str(e) 暴露给客户端 (可能泄露 SQL / 文件路径 / 内部组件名)
+            # 通用错误消息给前端; 错误码 + 完整 traceback 进后端日志
+            import uuid
+            import logging as _logging
+            _err_id = uuid.uuid4().hex[:12]
+            _logging.getLogger(__name__).exception(
+                f"[chat SSE error {_err_id}] session_id={session_id} user_id={user_id}: {e}"
+            )
             await db.rollback()
-            yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
+            yield json.dumps({
+                "error": "AI 服务暂时不可用，请稍后重试",
+                "error_id": _err_id,
+            }, ensure_ascii=False) + "\n"
         finally:
             # 清除 AI 对话中标记（流结束/中断）
             try:
