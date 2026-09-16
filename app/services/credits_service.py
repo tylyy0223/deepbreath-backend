@@ -1,7 +1,11 @@
 """Credits 计费服务 — 定价、余额、扣费、入账"""
 from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.redis import redis_client
 from app.models.credits import CreditTransaction
+
+# 余额缓存 TTL (秒). 写流水时主动 invalidate
+BALANCE_CACHE_TTL = 60
 
 # ==== 定价（单位：Credit，1 Credit = ¥0.01）====
 PRICING = {
@@ -46,26 +50,47 @@ def chat_cost(mode: str) -> int:
     return PRICING.get(f"chat_{mode}", PRICING["chat_science"])
 
 
-async def get_balance(db: AsyncSession, user_id: int) -> int:
+async def get_balance(db, user_id, *, use_cache=True):
+    cache_key = f"user:balance:{user_id}"
+    if use_cache:
+        try:
+            cached = await redis_client.get(cache_key)
+            if cached is not None:
+                return int(cached)
+        except Exception:
+            pass
     r = await db.execute(
         select(func.coalesce(func.sum(CreditTransaction.amount), 0))
         .where(CreditTransaction.user_id == user_id)
     )
-    return int(r.scalar() or 0)
+    balance = int(r.scalar() or 0)
+    if use_cache:
+        try:
+            await redis_client.set(cache_key, balance, ex=BALANCE_CACHE_TTL)
+        except Exception:
+            pass
+    return balance
+
+
+async def _invalidate_balance_cache(user_id):
+    try:
+        await redis_client.delete(f"user:balance:{user_id}")
+    except Exception:
+        pass
 
 
 async def add_transaction(
     db: AsyncSession, user_id: int, amount: int, type: str,
     ref: str = "", note: str = "",
 ) -> CreditTransaction:
-    """写一条流水（不做余额校验，调用方负责）"""
-    balance = await get_balance(db, user_id)
+    balance = await get_balance(db, user_id, use_cache=False)
     tx = CreditTransaction(
         user_id=user_id, amount=amount, type=type, ref=ref, note=note,
         balance_after=balance + amount,
     )
     db.add(tx)
     await db.flush()
+    await _invalidate_balance_cache(user_id)
     return tx
 
 
