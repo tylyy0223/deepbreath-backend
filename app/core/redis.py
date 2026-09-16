@@ -68,13 +68,9 @@ async def revoke_all_refresh_tokens(user_id: int):
 # ============================================================
 
 async def check_rate_limit(key: str, max_requests: int, window_seconds: int) -> bool:
-    """滑动窗口速率限制，返回 True 表示允许"""
-    current = await redis_client.get(key)
-    if current is None:
-        await redis_client.set(key, 1, ex=window_seconds)
-        return True
-    count = int(current)
-    if count >= max_requests:
-        return False
-    await redis_client.incr(key)
-    return True
+    """原子速率限制 (INCR + EXPIRE pipeline)，返回 True 表示允许"""
+    pipe = redis_client.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, window_seconds, nx=True)
+    count, _ = await pipe.execute()
+    return count <= max_requests

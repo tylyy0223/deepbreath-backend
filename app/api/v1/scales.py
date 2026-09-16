@@ -83,6 +83,11 @@ async def submit_scale(
         raw_score = result["raw_score"]
         standard_score = result["standard_score"]
 
+    # 先扣费再存档（charge 内部有 advisory lock，保证原子性）
+    charged = await charge(db, user_id, cost, ref=f"scale:{scale_id}", note=f"量表测评·{SCALES[scale_id]['name']}")
+    if not charged:
+        raise HTTPException(status_code=402, detail="Credits 余额不足，请充值后再试")
+
     record = ScaleResult(
         user_id=user_id, scale_id=scale_id,
         raw_score=raw_score, standard_score=standard_score,
@@ -91,7 +96,6 @@ async def submit_scale(
         result_json=json.dumps(result, ensure_ascii=False),
     )
     db.add(record)
-    await charge(db, user_id, cost, ref=f"scale:{scale_id}", note=f"量表测评·{SCALES[scale_id]['name']}")
     await db.flush()
 
     return {"code": 0, "data": {"result_id": record.id, "scale_id": scale_id, **result}}

@@ -141,11 +141,6 @@ async def upload_image(file: UploadFile = File(...)):
             detail=f"文件内容与扩展名不符 (声明 {ext}, 实际 {real_fmt or '无法识别'}). 请上传真实图片",
         )
 
-    # 读取内容并校验大小
-    contents = await file.read()
-    if len(contents) > MAX_SIZE_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"文件大小超过 {MAX_SIZE_MB}MB 限制")
-
     # 自动压缩
     compressed, final_ext = _compress_image(contents, ext)
 

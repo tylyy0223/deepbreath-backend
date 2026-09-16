@@ -429,6 +429,17 @@ async def related_articles(
     db = async_session()
     try:
         from sqlalchemy import select as _sel
+        # 归属校验：防止越权读取他人会话
+        owner_check = await db.execute(
+            _sel(ChatSession.id).where(
+                ChatSession.id == session_id,
+                ChatSession.user_id == current_user["user_id"],
+            )
+        )
+        if not owner_check.scalar_one_or_none():
+            await db.close()
+            return {"code": 0, "data": {"articles": [], "total": 0}}
+
         r = await db.execute(
             _sel(ChatMessage.content)
             .where(ChatMessage.session_id == session_id, ChatMessage.role == "user")

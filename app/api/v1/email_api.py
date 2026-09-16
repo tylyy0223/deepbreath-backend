@@ -1,4 +1,6 @@
 """邮件发送 API"""
+import html
+import re
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, EmailStr
 from app.core.database import async_session
@@ -21,6 +23,15 @@ async def send_email(req: EmailRequest, current_user: dict = Depends(get_current
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="内容为空")
 
+    # 邮箱格式校验
+    if not re.match(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$', req.email):
+        raise HTTPException(status_code=400, detail="邮箱格式不正确")
+
+    # 频率限制：每用户每小时最多 10 封
+    from app.core.redis import check_rate_limit
+    if not await check_rate_limit(f"email:rl:{current_user['user_id']}", 10, 3600):
+        raise HTTPException(status_code=429, detail="邮件发送过于频繁，请稍后再试")
+
     cost = PRICING["email"]
     db = async_session()
     try:
@@ -36,25 +47,30 @@ async def send_email(req: EmailRequest, current_user: dict = Depends(get_current
 <h2 style="color:#7c8a7a">深呼吸 · AI 对话</h2>
 </div>
 <div style="background:#f8f6f3;border-radius:12px;padding:20px;line-height:1.8;white-space:pre-wrap">
-{req.content}
+{html.escape(req.content)}
 </div>
 <p style="color:#aaa;font-size:12px;margin-top:20px;text-align:center">
 —— 深呼吸 DeepBreath · 你的心理陪伴者
 </p>
 </body></html>"""
 
+    # 先扣费再发送（charge 内部有 advisory lock，保证原子性）
+    db2 = async_session()
+    try:
+        charged = await charge(db2, current_user["user_id"], cost, ref="email", note=f"邮件发送至 {req.email}")
+        await db2.commit()
+        if not charged:
+            raise HTTPException(status_code=402, detail="Credits 余额不足，请充值后再试")
+    except HTTPException:
+        raise
+    except Exception:
+        await db2.rollback()
+        raise
+    finally:
+        await db2.close()
+
     ok, err = send_html_email(req.email, req.subject, html)
     if not ok:
         raise HTTPException(status_code=500, detail=f"发送失败: {err}")
-
-    # 发送成功后扣费
-    db = async_session()
-    try:
-        await charge(db, current_user["user_id"], cost, ref="email", note=f"邮件发送至 {req.email}")
-        await db.commit()
-    except Exception:
-        await db.rollback()
-    finally:
-        await db.close()
 
     return {"code": 0, "message": "已发送"}
