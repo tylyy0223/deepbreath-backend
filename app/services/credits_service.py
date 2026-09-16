@@ -1,5 +1,5 @@
 """Credits 计费服务 — 定价、余额、扣费、入账"""
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.credits import CreditTransaction
 
@@ -70,9 +70,19 @@ async def add_transaction(
 
 
 async def charge(db: AsyncSession, user_id: int, cost: int, ref: str = "", note: str = "") -> bool:
-    """扣费：余额足够返回 True 并写流水；不足返回 False"""
+    """扣费：余额足够返回 True 并写流水；不足返回 False
+
+    并发安全: 用 pg_advisory_xact_lock(user_id) 在事务级串行化同一用户的扣费。
+    避免两个并发请求都查到 balance=100 都判断通过、都写 -80 的流水导致实际余额 -60。
+    lock 在事务结束时 (commit/rollback) 自动释放。
+    """
     if cost <= 0:
         return True
+    # PG advisory lock 基于 user_id 哈希 (避免占满单数字空间), 事务级自动释放
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:uid)"),
+        {"uid": user_id},
+    )
     balance = await get_balance(db, user_id)
     if balance < cost:
         return False

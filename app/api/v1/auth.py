@@ -11,6 +11,7 @@ from app.core.security import (
 )
 from app.core.redis import (
     store_refresh_token, validate_refresh_token, revoke_refresh_token,
+    redis_client,
 )
 from app.models.user import User, UserProfile
 from app.models.cache import LoginLog
@@ -54,6 +55,41 @@ def _get_ip(request: Request) -> str:
     if real_ip:
         return real_ip.strip()
     return request.client.host if request.client else ""
+
+
+# ==== 登录频率限制 (防暴力破解) ====
+LOGIN_FAIL_THRESHOLD = 5      # 失败 N 次触发锁定
+LOGIN_FAIL_WINDOW = 600       # 计数窗口 (秒) - 10 分钟
+LOGIN_LOCK_TTL = 600          # 锁定时长 (秒) - 10 分钟
+
+async def _check_login_locked(identifier: str, ip: str) -> int:
+    """检查账号/IP 是否被锁, 返回剩余秒数 (0 = 未锁)"""
+    try:
+        for key in [f"login_fail:id:{identifier}", f"login_fail:ip:{ip}"]:
+            cnt = await redis_client.get(key)
+            if cnt and int(cnt) >= LOGIN_FAIL_THRESHOLD:
+                ttl = await redis_client.ttl(key)
+                return max(ttl, 1)
+    except Exception:
+        pass
+    return 0
+
+async def _record_login_failure(identifier: str, ip: str):
+    """记录登录失败: 账号 + IP 双向计数, 超过阈值锁定"""
+    try:
+        for key in [f"login_fail:id:{identifier}", f"login_fail:ip:{ip}"]:
+            cnt = await redis_client.incr(key)
+            if cnt == 1:
+                await redis_client.expire(key, LOGIN_FAIL_WINDOW)
+    except Exception:
+        pass
+
+async def _clear_login_failures(identifier: str, ip: str):
+    """登录成功后清除账号 + IP 的失败计数"""
+    try:
+        await redis_client.delete(f"login_fail:id:{identifier}", f"login_fail:ip:{ip}")
+    except Exception:
+        pass
 
 
 async def _log_login(user_id: int | None, email: str, action: str, success: bool, request: Request, detail: str = ""):
@@ -149,12 +185,24 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     """用户登录：手机号+密码（默认）| 手机号+验证码 | 邮箱+密码（次要）"""
     phone = (req.phone or "").strip()
     email = (req.email or "").strip().lower()
+    ip = _get_ip(request)
+    identifier = phone or email
+
+    # ==== 频率限制: 账号 + IP 双向计数, 阈值 5 次/10分钟 锁 10 分钟 ====
+    lock_ttl = await _check_login_locked(identifier or ip, ip)
+    if lock_ttl > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"登录失败次数过多, 请 {lock_ttl} 秒后再试",
+            headers={"Retry-After": str(lock_ttl)},
+        )
 
     # ---- 手机号登录（密码默认；验证码为辅）----
     if phone:
         result = await db.execute(select(User).where(User.phone == phone))
         user = result.scalar_one_or_none()
         if not user:
+            await _record_login_failure(identifier, ip)
             await _log_login(None, phone, "login", False, request, "手机号未注册")
             raise HTTPException(status_code=401, detail="该手机号未注册，请先注册")
         if req.password:
@@ -170,15 +218,18 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
                 await db.flush()
                 password_ok = True
             if not password_ok:
+                await _record_login_failure(identifier, ip)
                 await _log_login(user.id, user.email, "login", False, request, "密码错误")
                 raise HTTPException(status_code=401, detail="密码错误")
         elif req.sms_code:
             # 手机号 + 验证码（辅助）
             if not await verify_code(phone, req.sms_code):
+                await _record_login_failure(identifier, ip)
                 await _log_login(user.id, user.email, "login", False, request, "验证码错误")
                 raise HTTPException(status_code=401, detail="验证码错误或已过期")
         else:
             raise HTTPException(status_code=400, detail="请输入密码或验证码")
+        await _clear_login_failures(identifier, ip)
         return await _finalize_login(user, request, db)
 
     # ---- 邮箱 + 密码登录 ----
@@ -188,6 +239,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     user = result.scalar_one_or_none()
 
     if not user:
+        await _record_login_failure(identifier or email, ip)
         await _log_login(None, email, "login", False, request, "用户不存在")
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
 
@@ -204,9 +256,11 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
         password_ok = True
 
     if not password_ok:
+        await _record_login_failure(identifier, ip)
         await _log_login(user.id, email, "login", False, request, "密码错误")
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
 
+    await _clear_login_failures(identifier, ip)
     return await _finalize_login(user, request, db)
 
 

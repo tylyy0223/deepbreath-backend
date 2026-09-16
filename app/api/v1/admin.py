@@ -20,10 +20,21 @@ async def online_monitor(
     now = int(datetime.now(timezone.utc).timestamp())
 
     # 在线用户（middleware + chat 接口刷新 online:{user_id}，5 分钟窗口）
-    try:
-        online_keys = await redis_client.keys("online:*")
-    except Exception:
-        online_keys = []
+    # 用 SCAN 替代 KEYS: KEYS 在生产 Redis 上是 O(N) 阻塞命令, 大量 key 时会卡整个 Redis
+    async def _scan(pattern: str) -> list[str]:
+        keys: list[str] = []
+        try:
+            cursor = 0
+            while True:
+                cursor, batch = await redis_client.scan(cursor=cursor, match=pattern, count=100)
+                keys.extend(batch)
+                if cursor == 0:
+                    break
+        except Exception:
+            pass
+        return keys
+
+    online_keys = await _scan("online:*")
     online: list[dict] = []
     for k in online_keys:
         uid = k.split(":", 1)[1]
@@ -38,10 +49,7 @@ async def online_monitor(
         online.append({"user_id": uid_int, "last_active_ts": last_active})
 
     # 当前 AI 对话中用户（chat 流式进行中，ai_active:{user_id}）
-    try:
-        ai_keys = await redis_client.keys("ai_active:*")
-    except Exception:
-        ai_keys = []
+    ai_keys = await _scan("ai_active:*")
     ai_active_ids = set()
     for k in ai_keys:
         try:
@@ -164,13 +172,30 @@ async def update_user_role(
     current_user: dict = Depends(require_role(Roles.ADMIN)),
     db: AsyncSession = Depends(get_db),
 ):
-    """修改用户角色"""
-    if role not in [Roles.USER, Roles.EDITOR, Roles.MODERATOR, Roles.ADMIN]:
+    """修改用户角色
+
+    安全规则:
+    - 任何 admin 都可以把别人的角色在 USER/EDITOR/MODERATOR 之间调整, 但不能给任何人(包括自己)赋 SUPERUSER
+    - 只有 superuser 才能把别人的角色设为 SUPERUSER, 且不能给自己降权 (防误操作锁死账号)
+    """
+    if role not in [Roles.USER, Roles.EDITOR, Roles.MODERATOR, Roles.ADMIN, Roles.SUPERUSER]:
         raise HTTPException(status_code=400, detail="无效角色")
     r = await db.execute(select(User).where(User.id == user_id))
     user = r.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
+
+    # === superuser 防护: 提升到 superuser 需要 current_user 自身是 superuser ===
+    if role == Roles.SUPERUSER and current_user.get("role") != Roles.SUPERUSER:
+        raise HTTPException(
+            status_code=403,
+            detail="无权限设置 SUPERUSER. 此操作仅 SUPERUSER 可执行, 且不能自助提权",
+        )
+
+    # 防 superuser 给自己降权 (避免误操作锁死系统账号)
+    if user_id == current_user.get("id") and user.role == Roles.SUPERUSER and role != Roles.SUPERUSER:
+        raise HTTPException(status_code=403, detail="不能修改自己的 SUPERUSER 角色")
+
     user.role = role
     await db.flush()
     return {"code": 0, "message": f"用户角色已更新为 {role}"}

@@ -12,6 +12,34 @@ UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/data/deepbreath/uploads")
 MAX_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "10"))
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "heic", "heif"}
 
+# 扩展名 -> PIL Image.format 白名单 (实际解析后的 format 必须落在这组里)
+# 防止攻击者改后缀绕过: 上传 evil.jpg 实际是 .exe / .svg / HTML 都会被拒
+ALLOWED_MIME_BY_EXT = {
+    "jpg": {"JPEG"},
+    "jpeg": {"JPEG"},
+    "png": {"PNG"},
+    "gif": {"GIF"},
+    "webp": {"WEBP"},
+    "heic": {"HEIF", "HEIC"},
+    "heif": {"HEIF", "HEIC"},
+}
+
+
+def _verify_real_mime(contents: bytes, ext: str) -> str | None:
+    """用 PIL Image.verify() 验证文件实际格式, 返回真实 format 或 None (不可信)
+
+    不依赖文件名/Content-Type, 只看 magic bytes. 失败返回 None.
+    """
+    if not _PIL_AVAILABLE:
+        return None  # PIL 不可用, 跳过 MIME 验证 (降级到仅扩展名)
+    try:
+        img = Image.open(io.BytesIO(contents))
+        img.verify()  # 校验文件结构合法性 (防止伪装的 polyglot)
+        fmt = img.format.upper() if img.format else ""
+        return fmt
+    except Exception:
+        return None
+
 # 压缩配置
 MAX_DIMENSION = int(os.environ.get("IMAGE_MAX_DIMENSION", "2048"))  # 最长边像素
 JPEG_QUALITY = int(os.environ.get("IMAGE_JPEG_QUALITY", "82"))      # JPEG/WebP 质量
@@ -94,10 +122,24 @@ def _compress_image(contents: bytes, ext: str) -> tuple[bytes, str]:
 @router.post("/image")
 async def upload_image(file: UploadFile = File(...)):
     """上传单张图片（自动压缩），返回可访问的图片 URL"""
-    # 校验扩展名
+    # 1. 校验扩展名
     ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else ""
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"不支持的文件格式：{ext}。支持：{', '.join(sorted(ALLOWED_EXTENSIONS))}")
+
+    # 2. 读取内容 (限制大小, 防止 OOM)
+    contents = await file.read()
+    if len(contents) > MAX_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"文件超过 {MAX_SIZE_MB}MB 限制")
+
+    # 3. 验证真实 MIME (防扩展名伪装): PIL Image.verify() 检查 magic bytes + 文件结构
+    real_fmt = _verify_real_mime(contents, ext)
+    allowed_fmts = ALLOWED_MIME_BY_EXT.get(ext, set())
+    if real_fmt is None or (allowed_fmts and real_fmt not in allowed_fmts):
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件内容与扩展名不符 (声明 {ext}, 实际 {real_fmt or '无法识别'}). 请上传真实图片",
+        )
 
     # 读取内容并校验大小
     contents = await file.read()
