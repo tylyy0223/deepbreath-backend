@@ -125,11 +125,23 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
 
 
 import hashlib
+import hmac
+import os as _os_legacy
 
 def _verify_legacy_sha256(password: str, stored_hash: str) -> bool:
-    """兼容旧 psy-chat 的 SHA-256 + salt 密码"""
-    legacy = hashlib.sha256((password + "psy2024salt").encode()).hexdigest()
-    return legacy == stored_hash
+    """兼容旧 psy-chat 的 SHA-256 + salt 密码 (过渡期)
+
+    安全加固:
+    - 硬编码盐 "psy2024salt" 已从源码移除, 改为从 .env LEGACY_PASSWORD_SALT 读
+      (未设置则用空串, 仅首次部署兼容, 后续应全部迁移到 bcrypt 后删除此函数)
+    - 用 hmac.compare_digest 防时序攻击 (避免 == 字符串比较泄露前缀匹配信息)
+
+    新密码已统一用 bcrypt (security.py pwd_context).
+    此函数仅在用户登录时验证旧 hash, 成功后立刻 rehash 到 bcrypt 落库.
+    """
+    salt = _os_legacy.environ.get("LEGACY_PASSWORD_SALT", "")
+    legacy = hashlib.sha256((password + salt).encode()).hexdigest()
+    return hmac.compare_digest(legacy, stored_hash)
 
 
 @router.post("/login", response_model=TokenResponse)

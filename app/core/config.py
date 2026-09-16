@@ -48,7 +48,8 @@ class Settings(BaseSettings):
         return f"redis://{pw}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
 
     # JWT
-    JWT_SECRET_KEY: str = "deep-breath-jwt-secret-change-in-production-2026"
+    # JWT_SECRET_KEY 必填: 从 .env 读取, 不设默认值 (避免 .env 加载失败时用公开密钥伪造 token)
+    JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 小时
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -86,8 +87,11 @@ class Settings(BaseSettings):
     SMTP_USER: str = "505055601@qq.com"
     SMTP_PASSWORD: str = ""
 
-    # 跨域
-    CORS_ORIGINS: list[str] = ["*"]
+    # 跨域 (main.py 里按环境拆分白名单; 此处默认仅 dev 本地, 生产必须 .env 显式覆盖)
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
 
     # 日志
     LOG_LEVEL: str = "INFO"
@@ -99,3 +103,17 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# === 启动期安全校验: 防止 .env 加载失败导致 JWT 用公开默认值 ===
+import sys as _sys
+_jwt = settings.JWT_SECRET_KEY or ''
+_errs = []
+if not _jwt or len(_jwt) < 32:
+    _errs.append('JWT_SECRET_KEY 未配置或太短 (当前 %d 字符, 要求 >= 32)' % len(_jwt))
+if settings.CORS_ORIGINS == ["*"]:
+    _errs.append("CORS_ORIGINS 仍为 '*', 与 allow_credentials=True 一起等于 CSRF 公开. 请显式设置白名单")
+if _errs:
+    print('\n[CONFIG ERROR] 启动被安全检查拦截:', file=_sys.stderr)
+    for _e in _errs:
+        print('  - ' + _e, file=_sys.stderr)
+    _sys.exit(1)

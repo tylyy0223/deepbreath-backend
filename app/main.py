@@ -23,13 +23,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# === CORS 白名单 ===
+# settings.CORS_ORIGINS 默认只有 dev 本地; 生产环境必须在 .env 显式设置:
+#   CORS_ORIGINS=https://luoyuyu.cn,https://www.luoyuyu.cn
+# 安全: 不允许 allow_origins=[*] + allow_credentials=True 组合 (CSRF 公开风险)
+import os as _os
+_cors_origins = settings.CORS_ORIGINS
+if isinstance(_cors_origins, str):
+    _cors_origins = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+if "*" in _cors_origins:
+    raise RuntimeError(
+        "CORS 拒绝 allow_origins=[*] + allow_credentials=True 组合 (CSRF 公开风险). "
+        "请在 .env 显式设置白名单, 例: CORS_ORIGINS=https://luoyuyu.cn"
+    )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    max_age=86400,
 )
 
 
