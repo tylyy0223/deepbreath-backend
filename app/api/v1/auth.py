@@ -111,6 +111,26 @@ async def _log_login(user_id: int | None, email: str, action: str, success: bool
 @router.post("/register", response_model=TokenResponse)
 async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """用户注册（手机号唯一 + 短信验证）"""
+    ip = _get_ip(request)
+
+    # ==== IP 限频: 同一 IP 1 小时内最多 3 次注册, 防批量注册薅 REGISTER_GIFT=1000 ====
+    register_ip_key = f"register_fail:ip:{ip}"
+    try:
+        cnt = await redis_client.incr(register_ip_key)
+        if cnt == 1:
+            await redis_client.expire(register_ip_key, 3600)  # 1 小时窗口
+        if cnt > 3:
+            ttl = await redis_client.ttl(register_ip_key)
+            raise HTTPException(
+                status_code=429,
+                detail=f"该 IP 注册过于频繁, 请 {ttl} 秒后再试",
+                headers={"Retry-After": str(ttl)},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis 不可用不阻塞注册
+
     # 邮箱选填：非空才做查重
     if req.email:
         existing = await db.execute(select(User).where(User.email == req.email))

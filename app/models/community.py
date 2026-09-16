@@ -1,6 +1,6 @@
 """社区模型"""
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, DateTime, Text, ForeignKey, Boolean, JSON
+from sqlalchemy import String, Integer, DateTime, Text, ForeignKey, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
@@ -35,6 +35,11 @@ class CommunityReply(Base):
 
 class CommunityLike(Base):
     __tablename__ = "community_likes"
+    __table_args__ = (
+        # 修复点赞竞态: 同一用户对同一帖子只能点赞一次
+        # 原代码靠应用层 if-not-exists 逻辑, 高并发下可产生重复行, 导致 like_count > 实际点赞人数
+        UniqueConstraint("post_id", "user_id", name="uq_community_likes_post_user"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     post_id: Mapped[int] = mapped_column(Integer, ForeignKey("community_posts.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
