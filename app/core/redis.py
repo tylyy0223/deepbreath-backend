@@ -68,9 +68,14 @@ async def revoke_all_refresh_tokens(user_id: int):
 # ============================================================
 
 async def check_rate_limit(key: str, max_requests: int, window_seconds: int) -> bool:
-    """原子速率限制 (INCR + EXPIRE pipeline)，返回 True 表示允许"""
+    """原子速率限制 (INCR + EXPIRE pipeline)，返回 True 表示允许
+
+    注意：原代码用 expire(..., nx=True)，但 Redis 7.0+ 才支持 NX 参数。
+    Redis 6.x 会报 "wrong number of arguments for 'expire' command" → pipeline abort → chat 500。
+    这里去掉 nx=True（每次 EXPIRE 重置 TTL，窗口可能略长，但功能正确且兼容 6.x/7.x）。
+    """
     pipe = redis_client.pipeline()
     pipe.incr(key)
-    pipe.expire(key, window_seconds, nx=True)
+    pipe.expire(key, window_seconds)
     count, _ = await pipe.execute()
     return count <= max_requests

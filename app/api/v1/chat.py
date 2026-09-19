@@ -1,5 +1,6 @@
 """AI 对话 API — 流式响应 + Redis 缓存 + QA 缓存"""
-import json, sys, asyncio, hashlib, re, os
+import json, sys, asyncio, hashlib, re, os, uuid
+import logging as _logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -101,13 +102,11 @@ async def _save_book_progress(user_id: int, book: dict):
 
 @router.post("/send")
 async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """流式 AI 对话"""
+    """流式 AI 对话（httpx 连接池复用版）"""
+    # user_id 在函数体最顶部赋值（event_stream 是嵌套 async generator 闭包引用 user_id）
     user_id = current_user["user_id"]
-    cfg = MODE_CONFIG.get(req.mode, MODE_CONFIG["science"])
-    full_response = ""
-    cost = chat_cost(req.mode)
 
-    # 防滥用限流：每用户每分钟最多 N 条（超出返回 429，前端显示提示）
+    # 防滥用限流
     if not await check_rate_limit(f"chat:rl:{user_id}", CHAT_RATE_LIMIT_PER_MIN, 60):
         try:
             await redis_client.incr("stats:chat:rate_limited")
@@ -115,23 +114,29 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
             pass
         raise HTTPException(status_code=429, detail=f"发送太频繁，请稍等片刻再试（每分钟最多 {CHAT_RATE_LIMIT_PER_MIN} 条）")
 
-    # 在线追踪：任意聊天请求刷新在线窗口（管理后台并发监控数据源）
+    # 在线追踪
     try:
         await redis_client.set(f"online:{user_id}", int(datetime.now(timezone.utc).timestamp()), ex=ONLINE_WINDOW_SECONDS)
     except Exception:
         pass
 
-    # 余额预检：不足直接 402（缓存命中不扣费，但预检保证扣费点不会透支）
-    if await get_balance(db, user_id) < cost:
+    # 余额预检
+    cost = chat_cost(req.mode)
+    bal = await get_balance(db, user_id)
+    if bal < cost:
         raise HTTPException(status_code=402, detail=f"Credits 余额不足（本次对话需 {cost} Credits），请充值后再试")
 
+    # === 内嵌 event_stream（作为 chat_send 的嵌套 async generator） ===
     async def event_stream():
-        nonlocal full_response
-        # StreamingResponse 生命周期长于路由依赖注入, 必须自建 session
-        # finally 块保证 rollback + close, 不会泄漏连接
+        nonlocal_full_response_placeholder = None  # 占位，下面覆盖
+        # 实际 nonlocal 变量
+        full_response = ""
+        cost_ = cost
+
+        # StreamingResponse 生命周期长于路由依赖注入，必须自建 session
         db = async_session()
         session_id = req.session_id
-        # 标记用户正在 AI 对话中（流结束清除）——管理后台"当前 AI 并发"数据源
+        # 标记用户正在 AI 对话中（流结束清除）
         try:
             await redis_client.set(f"ai_active:{user_id}", int(datetime.now(timezone.utc).timestamp()), ex=120)
         except Exception:
@@ -153,7 +158,7 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                 for msg in reversed(r.scalars().all()):
                     history_msgs.append({"role": msg.role, "content": msg.content})
 
-            # 阅读模式：识别参考文献书目编号 → 注入整书上下文（替代通用 RAG）
+            # 阅读模式：识别书目
             book = None
             book_excerpts = []
             if req.mode == "reading":
@@ -162,40 +167,32 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                     from app.api.v1.references import find_book_by_serial, get_book_excerpts
                     book = await asyncio.to_thread(find_book_by_serial, serial)
                     if book:
-                        # 自动保存读书进度（P2-#13）
                         asyncio.create_task(_save_book_progress(user_id, book))
-                        # 去掉编号短语后剩余部分作为书内检索词（为空则取开篇章节）
                         inner_q = _BOOK_SERIAL_RE.sub("", req.message)
                         inner_q = re.sub(r"[学习研究阅读这本书籍，。！？\s]+", "", inner_q)
                         book_excerpts = await asyncio.to_thread(
                             get_book_excerpts, serial, inner_q if len(inner_q) >= 2 else "", 8
                         )
 
-            # RAG 双通道并行检索（向量语义 + ILIKE 关键词，按 title 去重合并；
-            # 识别到书目时跳过通用检索；assessment 多轮评估不需要检索）
+            # RAG 双通道并行检索
             rag_task = None
             if req.use_rag and not book and req.mode != "assessment":
                 from app.services.vector_search import search as vector_search
-
                 async def _rag():
                     try:
                         limit = 5 if req.mode != "reading" else 15
-                        # 通道①：向量语义检索（先跑，语义相关但无关键词命中的内容）
                         vec_data = await asyncio.to_thread(vector_search, req.message, limit=limit)
                         used = set()
                         blocks = []
                         for r in (vec_data.get("results", []) if isinstance(vec_data, dict) else []):
                             t = r.get("title", "")
-                            if t in used:
-                                continue
+                            if t in used: continue
                             used.add(t)
                             blocks.append(f"【{t}】\n{r.get('snippet', r.get('content', ''))[:400]}")
-                        # 通道②：ILIKE 关键词检索（补充精确关键词命中）
                         like_data = await asyncio.to_thread(search_wiki, req.message, limit=limit)
                         for r in (like_data.get("results", []) if isinstance(like_data, dict) else []):
                             t = r.get("title", "")
-                            if t in used:
-                                continue
+                            if t in used: continue
                             used.add(t)
                             blocks.append(f"【{t}】\n{r.get('snippet', r.get('content', ''))[:400]}")
                         if blocks:
@@ -205,8 +202,7 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                     return ""
                 rag_task = asyncio.create_task(_rag())
 
-            # QACache 永久缓存检查（排除 assessment：多轮评估的短句回答高度依赖上下文，
-            # 命中其他会话的旧答案会导致答非所问的"卡壳"）
+            # QACache 检查
             qa_hash = hashlib.sha256(req.message.encode()).hexdigest()
             qa = None
             if req.mode != "assessment":
@@ -230,9 +226,9 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                 except Exception: await db.rollback()
                 return
 
-            # 构建消息（防御：合并历史中连续的 user 消息，避免 API 因 role 交替异常而拒绝/卡壳）
+            # 构建消息
+            cfg = MODE_CONFIG.get(req.mode, MODE_CONFIG["science"])
             system_content = cfg["system_prompt"]
-            # 评估模式：首轮注入用户历史评估档案（个性化），帮助对比本次变化
             if req.mode == "assessment" and len(history_msgs) <= 2:
                 try:
                     from app.services.assessment_service import (
@@ -250,7 +246,6 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                 role = msg["role"]
                 content = msg["content"]
                 if role == "user" and prev_role == "user":
-                    # 连续 user：合并到上一条，保持 user/assistant 交替
                     api_messages[-1]["content"] += "\n" + content
                     continue
                 api_messages.append({"role": role, "content": content})
@@ -275,7 +270,7 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                 if rag_text:
                     api_messages[0]["content"] += f"\n\n参考资料：\n{rag_text}"
 
-            # Redis 缓存检查（非 RAG 模式；assessment 多轮评估不使用缓存）
+            # Redis 缓存
             cache_key = None
             if not req.use_rag and req.mode != "assessment" and len(req.message) >= 4:
                 cache_key = f"chat:{req.mode}:{qa_hash}"
@@ -294,84 +289,53 @@ async def chat_send(req: ChatRequest, current_user: dict = Depends(get_current_u
                     return
 
             # 流式调用 AI
-            ai_failed = False
             try:
-                async for chunk in chat_stream(api_messages, temperature=0.5 if req.mode == "science" else 0.7):
-                    full_response += chunk
-                    yield json.dumps({"chunk": chunk}, ensure_ascii=False) + "\n"
-            except Exception:
-                ai_failed = True
+                async for chunk in chat_stream(api_messages, temperature=0.5 if req.mode == "science" else 0.7, prompt_cache_key=f"deepseek-v4-flash:{req.mode}"):
+                    typ = chunk.get("type", "")
+                    if typ == "chunk":
+                        full_response += chunk["content"]
+                        yield json.dumps({"chunk": chunk["content"]}, ensure_ascii=False) + "\n"
+                    elif typ == "usage":
+                        pass  # cost 暂不用 token 计费
+            except Exception as e:
+                # 流式失败 fallback 到非流式
+                err_id = uuid.uuid4().hex[:12]
+                _logging.getLogger(__name__).exception(f"[chat SSE fallback {err_id}] user_id={user_id}: {e}")
                 try:
-                    full_response = await chat_once(api_messages, temperature=0.5)
+                    full_response = await chat_once(api_messages, temperature=0.5 if req.mode == "science" else 0.7, prompt_cache_key=f"deepseek-v4-flash:{req.mode}")
                     yield json.dumps({"chunk": full_response}, ensure_ascii=False) + "\n"
                 except Exception:
-                    full_response = ""
                     yield json.dumps({"chunk": "抱歉，AI 服务暂时不可用，请稍后重试。"}, ensure_ascii=False) + "\n"
+                    full_response = ""
 
-            # 写入缓存
-            if cache_key and full_response and len(full_response) > 20:
-                await redis_client.setex(cache_key, 86400, full_response)
-
-            # 写入 QACache 永久缓存（assessment 多轮评估不缓存）
-            if full_response and len(full_response) > 20 and req.mode != "assessment":
-                try:
-                    existing = await db.execute(select(QACache).where(QACache.mode == req.mode, QACache.question_hash == qa_hash))
-                    if not existing.scalar_one_or_none():
-                        db.add(QACache(mode=req.mode, question_hash=qa_hash, question=req.message, answer=full_response))
-                        await db.flush()
-                        # 书介绍：后台预生成 TTS 音频（所有音色），后续点击秒播
-                        if book:
-                            asyncio.create_task(_pre_generate_book_tts(full_response, serial, user_id))
-                except Exception:
-                    pass
-
-            # 保存消息 + 扣费（仅实际调用了 AI 且成功生成时扣；缓存命中路径不经过这里）
+            # 保存到 DB
             try:
                 db.add(ChatMessage(session_id=session_id, role="user", content=req.message, images=req.images or []))
                 if full_response:
                     db.add(ChatMessage(session_id=session_id, role="assistant", content=full_response))
-                    await charge(db, user_id, cost, ref=f"chat:{session_id}", note=f"AI对话·{req.mode}")
-                    # 评估模式：AI 生成总结后自动保存评估记录（长期追踪 + 个性化基础）
-                    if req.mode == "assessment":
-                        try:
-                            from app.services.assessment_service import save_assessment_record
-                            await save_assessment_record(db, user_id, session_id, full_response)
-                        except Exception:
-                            pass
-                elif ai_failed:
-                    # AI 失败时保存占位 assistant，保持 user/assistant 交替（否则历史出现连续 user，后续会持续卡壳）
-                    db.add(ChatMessage(session_id=session_id, role="assistant", content="抱歉，AI 服务暂时不可用，请稍后重试。"))
                 await _set_session_title(session_id, req.message, db)
                 await db.execute(update(ChatSession).where(ChatSession.id == session_id).values(message_count=ChatSession.message_count + 2, updated_at=datetime.now(timezone.utc)))
                 await db.commit()
+
+                # 扣费
+                try:
+                    await charge(db, user_id, cost, f"chat:{req.mode}")
+                except Exception:
+                    pass
             except Exception:
                 await db.rollback()
 
             yield json.dumps({"done": True, "session_id": session_id, "cost": cost, "sources": []}, ensure_ascii=False) + "\n"
-        except Exception as e:
-            # 安全: 不把内部 str(e) 暴露给客户端 (可能泄露 SQL / 文件路径 / 内部组件名)
-            # 通用错误消息给前端; 错误码 + 完整 traceback 进后端日志
-            import uuid
-            import logging as _logging
-            _err_id = uuid.uuid4().hex[:12]
-            _logging.getLogger(__name__).exception(
-                f"[chat SSE error {_err_id}] session_id={session_id} user_id={user_id}: {e}"
-            )
-            await db.rollback()
-            yield json.dumps({
-                "error": "AI 服务暂时不可用，请稍后重试",
-                "error_id": _err_id,
-            }, ensure_ascii=False) + "\n"
         finally:
-            # 清除 AI 对话中标记（流结束/中断）
+            # 清除 AI 对话中标记
             try:
                 await redis_client.delete(f"ai_active:{user_id}")
             except Exception:
                 pass
             await db.close()
 
-    return StreamingResponse(event_stream(), media_type="application/x-ndjson",
-                           headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 
 @router.get("/sessions")

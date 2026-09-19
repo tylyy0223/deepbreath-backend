@@ -97,7 +97,7 @@ async def send_message(
     total_tokens = 0
     sources = []
     try:
-        async for chunk in chat_stream(messages=api_messages, temperature=0.7 if mode != "reading" else 0.3):
+        async for chunk in chat_stream(messages=api_messages, temperature=0.7 if mode != "reading" else 0.3, prompt_cache_key=f"deepseek-v4-flash:{mode}"):
             typ = chunk.get("type", "")
             if typ == "chunk":
                 full_response += chunk["content"]
@@ -108,7 +108,7 @@ async def send_message(
                 total_tokens = chunk.get("total_tokens", 0)
     except Exception:
         try:
-            full_response = await chat_once(api_messages, temperature=0.7 if mode != "reading" else 0.3)
+            full_response = await chat_once(api_messages, temperature=0.7 if mode != "reading" else 0.3, prompt_cache_key=f"deepseek-v4-flash:{mode}")
             yield {"chunk": full_response}
         except Exception:
             yield {"chunk": "抱歉，AI 服务暂时不可用，请稍后重试。"}
