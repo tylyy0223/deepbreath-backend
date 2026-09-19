@@ -21,7 +21,7 @@ DB_KW = dict(
     password=os.environ.get("DEEPBREATH_DB_PASSWORD") or os.environ.get("DB_PASSWORD", ""),
 )
 DEFAULT_LIMIT_MIN = 120  # 默认 120min/天, 实际从 app_settings 读
-AUDIO_LINK_SECRET = "deepbreath_audio_2026"  # 必须与 47.103.62.70 / 47.103.58.89 nginx /audio/ location 的 secure_link_md5 一致
+AUDIO_LINK_SECRET = os.environ.get("AUDIO_LINK_SECRET", "")  # 必须与 47.103.62.70 / 47.103.58.89 nginx /audio/ location 的 secure_link_md5 一致
 
 # serial -> 书名（wiki 004 树，听书列表书名显示用）
 BOOK_TITLES = {

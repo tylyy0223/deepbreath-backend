@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     DB_HOST: str = "127.0.0.1"
     DB_PORT: int = 5432
     DB_USER: str = "deepbreath"
-    DB_PASSWORD: str = "deepbreath_2026"
+    DB_PASSWORD: str = ""
     DB_NAME: str = "deepbreath"
 
     @property

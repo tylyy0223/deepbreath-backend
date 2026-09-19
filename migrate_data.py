@@ -11,7 +11,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 OLD_DB = "/root/psy-chat/psychat.db"
-PG_DSN = "host=127.0.0.1 port=5432 dbname=deepbreath user=deepbreath password=deepbreath_2026"
+PG_DSN = os.environ.get("DATABASE_URL", "")
 
 def migrate():
     sqlite = sqlite3.connect(OLD_DB)
