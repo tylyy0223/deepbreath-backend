@@ -79,7 +79,7 @@ def _get_client(stream: bool = True) -> httpx.AsyncClient:
                 connect=HTTP_TIMEOUT_CONNECT,
             ),
             limits=_client_limits,
-            http2=True,
+            # http2=True,  # 暂不启用（venv 缺 h2 包；HTTP/2 在 keepalive 下收益不大）
         )
     return _client
 
@@ -98,7 +98,7 @@ if not DEEPSEEK_API_KEY:
 else:
     logger.info(
         "DeepSeek API configured: base_url=%s, model=%s, key=%s... | "
-        "sem=%d, conn=%d, keepalive=%d, http2=on",
+        "sem=%d, conn=%d, keepalive=%d (HTTP/1.1)",
         DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY[:8],
         DEEPSEEK_MAX_CONCURRENT,
         _client_limits.max_connections,
