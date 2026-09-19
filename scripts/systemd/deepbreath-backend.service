@@ -1,0 +1,27 @@
+[Unit]
+Description=DeepBreath Backend (FastAPI + uvicorn)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/deep-breath/backend
+EnvironmentFile=/root/deep-breath/backend/.env
+# 默认禁用 vector_search（800MB SQLite 向量库会触发 OOM）。要恢复设 0。
+Environment=DISABLE_VECTOR_SEARCH=1
+# 单 worker（3.5GB 机器跑 2 worker + vector 会 OOM）。要扩 worker 必须先扩容机器。
+ExecStart=/root/deep-breath/backend/venv/bin/python3.11 /root/deep-breath/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8003 --workers 1
+Restart=always
+RestartSec=5
+# 内存硬限：超 1.2GB systemd 会 OOM-kill 并自动重启（uvicorn worker 自动 fork 新进程）。
+# 正常 chat 链路 ~200MB，800MB 是预警线，1.2GB 是 OOM 触发线。
+MemoryHigh=800M
+MemoryMax=1.2G
+# 日志走 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deepbreath-backend
+
+[Install]
+WantedBy=multi-user.target
