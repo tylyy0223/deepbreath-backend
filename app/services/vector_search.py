@@ -12,6 +12,12 @@ from app.services.env import ensure_env  # 统一 env 加载
 
 ensure_env()
 
+# === 应急禁用（2026-09-19 OOM fix）===
+# 向量数据库 800MB，加载到 Python 内存导致 worker 涨到 2.6GB → OOM Killed
+# 临时禁用 vector_search（依赖 ILIKE 关键词检索代替），
+# 恢复需要换 Qdrant/Milvus 等专用向量库。
+_VECTOR_SEARCH_DISABLED = os.environ.get("DISABLE_VECTOR_SEARCH", "1") == "1"
+
 # 独立脚本/测试路径兜底：ensure_env 可能因 pydantic-settings 已加载而跳过 os.environ 注入，
 # 此时手动从 .env 文件补读（幂等，仅在 os.environ 缺失时注入）
 def _env_fallback():
@@ -55,6 +61,9 @@ def _get_key():
 
 def _load_db(force=False):
     """延迟加载向量库（进程内缓存，支持 TTL 刷新）"""
+    if _VECTOR_SEARCH_DISABLED:
+        # 应急：禁用向量加载，避免 800MB SQLite + 向量驻留内存导致 OOM
+        return []
     global _db, _db_rows, _loaded_at
     if _db is None:
         if not os.path.isfile(VDB_PATH):
@@ -122,6 +131,8 @@ def _embed(text):
 def search(query, limit=5, threshold=0.30):
     """向量语义检索。返回与 search_wiki 兼容的 dict。"""
     t0 = time.time()
+    if _VECTOR_SEARCH_DISABLED:
+        return {"results": [], "total": 0, "query": query, "engine": "vector-disabled"}
     rows = _load_db()
     if not rows:
         logger.warning("向量库为空，跳过向量检索")
